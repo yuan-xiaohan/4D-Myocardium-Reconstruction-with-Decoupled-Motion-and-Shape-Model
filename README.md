@@ -4,7 +4,7 @@ This repository contains the code for the ICCV'2023 paper "4D Myocardium Reconst
 Xiaohan Yuan, Cong Liu, [Yangang Wang](https://www.yangangwang.com/#me)  
 
 \[[Paper](https://arxiv.org/pdf/2308.14083.pdf)\]
-![figure](/images/teaser.jpg#pic_center=180x180)
+<div align=center><img src="/images/teaser.jpg" width="50%"></div>
 
 
 ## Introduction
