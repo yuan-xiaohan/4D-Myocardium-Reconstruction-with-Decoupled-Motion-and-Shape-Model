@@ -118,6 +118,7 @@ def main_function(experiment_directory, data_source, continue_from):
     save_results = specs["Reconstruct_training"]
     initialize = specs["Initialize"]
     ini_path = specs["IniPath"]
+    initialize_cs = False
 
     do_code_regularization = get_spec_with_default(specs, "CodeRegularization", True)
     code_reg_lambda = get_spec_with_default(specs, "CodeRegularizationLambda", 1e-4)
@@ -161,7 +162,7 @@ def main_function(experiment_directory, data_source, continue_from):
     logging.info(decoder)
 
     # initialize latent Cs for each seq and Cm for each shape
-    if initialize:
+    if initialize_cs:
         Cs_path = os.path.join(ini_path, "C_s")
         c_s = torch.FloatTensor(deep_sdf.dataset.get_cs(Cs_path, train_split).detach().cpu())  # [seq_num, Cs_size]
         c_s.requires_grad = True
