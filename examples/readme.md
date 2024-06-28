@@ -18,8 +18,8 @@ This folder contains some data for running.
         |-- test.json
     |-- ini
         |-- C_s
-            # Initialized cs parameters.
-            |-- 000_00.obj
+            # Initialized cs parameters. (optional)
+            |-- 000_00.pth
             ...
         |-- ini.pth
             # Weights of the pre-trained ED shape model. 
