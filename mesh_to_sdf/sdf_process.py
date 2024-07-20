@@ -70,7 +70,7 @@ def transform_to_canonical(base_path, instance, output_path, test_sampling=False
     input_points_path = os.path.join(base_path, "points")
 
     # Get ED: phase = 00
-    vertices_ED, _ = obj_read(os.path.join(input_points_path, "01.obj"))
+    vertices_ED, _ = obj_read(os.path.join(input_points_path, "00.obj"))
 
     T = np.loadtxt(os.path.join(base_path, 'P.txt'))
     Ti = np.identity(4)
