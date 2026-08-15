@@ -1,5 +1,11 @@
 # 4D Myocardium Reconstruction
 
+[4D Myocardium Reconstruction with Decoupled Motion and Shape Model (ICCV 2023)](https://openaccess.thecvf.com/content/ICCV2023/papers/Yuan_4D_Myocardium_Reconstruction_with_Decoupled_Motion_and_Shape_Model_ICCV_2023_paper.pdf)
+
+<div align="center">
+  <img src="images/teaser.jpg" alt="Teaser: 4D myocardium reconstruction with decoupled motion and shape models" width="50%">
+</div>
+
 > [!IMPORTANT]
 > **🚀 NEW — Endo/epi 4DMM release pipeline**
 >
