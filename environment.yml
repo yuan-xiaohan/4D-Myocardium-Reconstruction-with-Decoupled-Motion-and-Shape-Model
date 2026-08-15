@@ -1,0 +1,20 @@
+name: 4DMM-release
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - torch==2.8.0
+      - numpy==1.26.4
+      - scipy==1.15.2
+      - opencv-python==4.12.0.88
+      - SimpleITK==2.5.0
+      - pyvista==0.46.4
+      - vtk==9.5.2
+      - trimesh==4.8.1
+      - scikit-image==0.25.2
+      - pyrender==0.1.45
+      - PyOpenGL==3.1.0
+      - scikit-learn==1.6.1
+      - matplotlib==3.10.1

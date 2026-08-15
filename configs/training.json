@@ -1,0 +1,21 @@
+{
+  "execution": {
+    "mode": "auto",
+    "devices": "auto"
+  },
+  "target_epoch": 50,
+  "batch_size": 16,
+  "samples_per_scene": 8000,
+  "surfaces": {
+    "endo": {
+      "enabled": true,
+      "initialization_mode": "scratch",
+      "resume_from": null
+    },
+    "epi": {
+      "enabled": true,
+      "initialization_mode": "scratch",
+      "resume_from": null
+    }
+  }
+}

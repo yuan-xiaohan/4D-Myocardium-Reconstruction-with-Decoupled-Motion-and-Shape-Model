@@ -1,0 +1,7 @@
+{
+  "assets/registration_template.npz": "1fb104b9632ddc73bebab4282769ec55cadd663ab6b1f828ea768f3eb0b6f30c",
+  "examples/acdc/4DMM/endo/specs.json": "490328ca739896192cbeff02bb24303d2933555149fff619eb4ff74bce5e9f67",
+  "examples/acdc/4DMM/endo/ModelParameters/latest.pth": "fab8c14ac2a02b3bd3f15b80d204e4aa3ca62ab0d1c7cdea719e52c814640166",
+  "examples/acdc/4DMM/epi/specs.json": "490328ca739896192cbeff02bb24303d2933555149fff619eb4ff74bce5e9f67",
+  "examples/acdc/4DMM/epi/ModelParameters/latest.pth": "17dff236cba1c41d4bb1b04a8485ef196cead3104d7326323ae678b777cd6d01"
+}

@@ -1,0 +1,14 @@
+{
+  "registration_template.npz": {
+    "sha256": "1fb104b9632ddc73bebab4282769ec55cadd663ab6b1f828ea768f3eb0b6f30c",
+    "purpose": "Minimal canonical registration point arrays and insertion curves",
+    "keys": [
+      "centerline",
+      "rv_raw",
+      "lv_norm",
+      "rv_norm",
+      "insertion_curve_0",
+      "insertion_curve_1"
+    ]
+  }
+}

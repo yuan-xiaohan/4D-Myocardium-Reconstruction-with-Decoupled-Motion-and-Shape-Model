@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+venv/
+.DS_Store
+*.log
+.idea/
+
+# Local generated data and runs. Raw ACDC data is never copied into this repo.
+process/
+outputs/
+inputs/*
+!inputs/README.md
+training_data/*
+!training_data/README.md
+*.partial.mp4
+.*.tmp

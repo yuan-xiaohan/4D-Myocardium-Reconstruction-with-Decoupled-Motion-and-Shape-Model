@@ -1,0 +1,26 @@
+{
+  "default": {
+    "reference_phase": 0,
+    "mirror": "auto",
+    "slice_order": "auto",
+    "num_iterations": 2000,
+    "phase_batch_size": 4,
+    "resolution": 64,
+    "preprocess_mode": "mask",
+    "device": "auto",
+    "skip_existing": true,
+    "retain_artifacts": false,
+    "video_order": "original",
+    "checkpoints": {
+      "endo": "examples/acdc/4DMM/endo",
+      "epi": "examples/acdc/4DMM/epi"
+    },
+    "stages": {
+      "preprocess": true,
+      "inference": true,
+      "postprocess": true,
+      "video": true
+    }
+  },
+  "cases": {}
+}
