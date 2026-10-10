@@ -77,7 +77,11 @@ def run_case_postprocess(config: CaseConfig, preprocess_report: dict) -> dict:
         "algorithm_version": POSTPROCESS_ALGORITHM_VERSION,
         "results": results,
         "all_passed": all(
-            item["n_open_edges"] == 0 and item["is_manifold"] for item in results
+            item["n_open_edges"] == 0
+            and item["is_manifold"]
+            and item["finite_points"]
+            and item["valid_face_indices"]
+            for item in results
         ),
     }
     if not report["all_passed"]:

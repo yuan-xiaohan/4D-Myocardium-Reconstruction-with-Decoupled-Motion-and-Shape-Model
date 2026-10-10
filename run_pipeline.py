@@ -35,6 +35,7 @@ def _atomic_json(path: Path, payload: dict) -> None:
 def _compact_preprocess_report(report: dict, retain_artifacts: bool) -> dict:
     result = dict(report)
     result["artifacts_retained"] = retain_artifacts
+    result.pop("registration_asset_sha256", None)
     if not retain_artifacts:
         result["manifests"] = {}
     return result
@@ -45,6 +46,12 @@ def _compact_inference_report(report: dict | None, retain_artifacts: bool) -> di
         return None
     result = dict(report)
     result["artifacts_retained"] = retain_artifacts
+    result["models"] = {
+        surface: {
+            key: value for key, value in metadata.items() if key != "sha256"
+        }
+        for surface, metadata in result.get("models", {}).items()
+    }
     if not retain_artifacts:
         result["results"] = [
             {key: value for key, value in item.items() if key != "mesh"}
@@ -71,6 +78,23 @@ def run_case(config: CaseConfig) -> dict:
     else:
         preprocess_report = load_preprocess_report(config)
         stages["preprocess"] = {"status": "reused"}
+
+    # Persist the completed transform before inference/postprocess/video so a
+    # later stage failure never discards P/Pi.  This is replaced by the final
+    # compact report after the case succeeds.
+    _atomic_json(
+        config.output_dir / "report.json",
+        {
+            "case_id": config.case_id,
+            "status": "running",
+            "config": config.to_json(),
+            "orientation": preprocess_report["orientation"],
+            "preprocess": _compact_preprocess_report(
+                preprocess_report, config.retain_artifacts
+            ),
+            "stages": stages,
+        },
+    )
 
     if config.stages["inference"]:
         inference_report = run_case_inference(config, preprocess_report)
@@ -167,6 +191,20 @@ def run_all_cases(
                 "error": str(error),
                 "traceback": traceback.format_exc(),
             }
+            partial_report = {}
+            report_path = config.output_dir / "report.json"
+            if report_path.is_file():
+                try:
+                    with report_path.open(encoding="utf-8") as handle:
+                        partial_report = json.load(handle)
+                except (OSError, json.JSONDecodeError):
+                    partial_report = {}
+            if partial_report.get("preprocess") is not None:
+                failure["preprocess"] = partial_report["preprocess"]
+            if partial_report.get("orientation") is not None:
+                failure["orientation"] = partial_report["orientation"]
+            if partial_report.get("stages") is not None:
+                failure["stages"] = partial_report["stages"]
             failures.append(failure)
             failure["config"] = config.to_json()
             _atomic_json(config.output_dir / "report.json", failure)

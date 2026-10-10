@@ -247,7 +247,12 @@ class PreprocessTests(unittest.TestCase):
                 "phase_mapping": [{"original_phase": 0, "internal_phase": 0, "t": 0.0}],
                 "orientation": {},
                 "manifests": {"endo": "temporary", "epi": "temporary"},
-                "transform": {},
+                "transform": {
+                    "P": np.eye(4).tolist(),
+                    "Pi": np.eye(4).tolist(),
+                    "offset": [0.0, 0.0, 0.0],
+                    "scale": 1.0,
+                },
             }
             with mock.patch("run_pipeline.run_preprocessing", return_value=preprocess), \
                  mock.patch("run_pipeline.run_case_inference", return_value={
@@ -263,6 +268,7 @@ class PreprocessTests(unittest.TestCase):
             self.assertFalse((root / "output" / "resolved_config.json").exists())
             self.assertFalse((root / "output" / "artifacts").exists())
             self.assertEqual(report["inference"]["results"][0], {"error": 0.1})
+            self.assertEqual(report["preprocess"]["transform"]["P"], np.eye(4).tolist())
 
     def test_reference_phase_rotation(self):
         mapping = phase_mapping([0, 1, 2, 3], 2)

@@ -1488,6 +1488,14 @@ def _surface_from_id(mesh, surface_id):
 
 def validate_combined_mesh(mesh):
     mesh = mesh.extract_surface().triangulate()
+    if mesh.n_points == 0 or mesh.n_cells == 0:
+        raise GeometryError("Combined mesh is empty")
+    points = np.asarray(mesh.points, dtype=np.float64)
+    if not np.isfinite(points).all():
+        raise GeometryError("Combined mesh contains NaN or infinite points")
+    faces = _triangle_faces(mesh)
+    if np.any(faces < 0) or np.any(faces >= mesh.n_points):
+        raise GeometryError("Combined mesh contains an invalid face index")
     if mesh.n_open_edges != 0:
         raise GeometryError(
             f"Combined mesh has {mesh.n_open_edges} open edges"
@@ -1555,6 +1563,9 @@ def validate_combined_mesh(mesh):
     return {
         "n_points": int(mesh.n_points),
         "n_cells": int(mesh.n_cells),
+        "finite_points": True,
+        "triangular_faces": True,
+        "valid_face_indices": True,
         "n_open_edges": int(mesh.n_open_edges),
         "is_manifold": bool(mesh.is_manifold),
         "epi_cells": int(epi.n_cells),
@@ -1632,4 +1643,3 @@ def clip_and_merge_surface_pair(epi_path, endo_path):
         endo_kept,
         diagnostics,
     )
-

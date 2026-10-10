@@ -31,12 +31,17 @@ def _load_json(path: Path) -> dict:
         return json.load(handle)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _project_code_norm_(codes: torch.Tensor, code_bound) -> None:
+    """Match the training-time ``Embedding(max_norm=CodeBound)`` behavior."""
+    if code_bound is None:
+        return
+    bound = float(code_bound)
+    if not math.isfinite(bound) or bound <= 0.0:
+        raise ValueError(f"CodeBound must be a positive finite number: {code_bound!r}")
+    with torch.no_grad():
+        norms = torch.linalg.vector_norm(codes, dim=-1, keepdim=True)
+        safe_norms = torch.clamp_min(norms, torch.finfo(codes.dtype).tiny)
+        codes.mul_((bound / safe_norms).clamp_max(1.0))
 
 
 def resolve_device(requested: str) -> str:
@@ -68,7 +73,6 @@ def load_decoder(surface: str, checkpoint_dir: Path, device: str):
         parameter.requires_grad_(False)
     metadata = {
         "path": str(checkpoint_path.resolve()),
-        "sha256": _sha256(checkpoint_path),
         "parameters": int(sum(parameter.numel() for parameter in decoder.parameters())),
     }
     return decoder, specs, metadata
@@ -93,7 +97,11 @@ def _load_case_frames(manifest_path: Path, mapping: list[dict], case_id: str, su
         if not path.is_file():
             raise FileNotFoundError(path)
         with np.load(path, allow_pickle=False) as archive:
+            points = torch.from_numpy(np.asarray(archive["pcd"], dtype=np.float32))
+            points = points[torch.isfinite(points).all(dim=1)]
             stored_t = float(np.asarray(archive["t"]).reshape(-1)[0])
+        if points.ndim != 2 or points.shape[1] != 4 or points.shape[0] == 0:
+            raise ValueError(f"Invalid SDF point cloud in {path}: {tuple(points.shape)}")
         if not np.isclose(stored_t, item["t"], rtol=0.0, atol=1e-6):
             raise ValueError(f"Time mismatch in {path}: {stored_t} vs {item['t']}")
         frames.append({
@@ -101,6 +109,7 @@ def _load_case_frames(manifest_path: Path, mapping: list[dict], case_id: str, su
             "internal_phase": int(item["internal_phase"]),
             "original_phase": int(item["original_phase"]),
             "t": float(item["t"]),
+            "points": points,
         })
     internal = [frame["internal_phase"] for frame in frames]
     if internal != list(range(len(frames))):
@@ -108,16 +117,28 @@ def _load_case_frames(manifest_path: Path, mapping: list[dict], case_id: str, su
     return frames
 
 
+def _sample_sdf_frame(frame: dict, subsample: int):
+    """Sample a cached frame while preserving the historical RNG behavior."""
+    points = frame.get("points")
+    if points is None:
+        # Lightweight unit-test and third-party callers may provide only an
+        # NPZ path; retain the original lazy loader for that public shape.
+        return get_sdf_samples_test(frame["npz"], subsample)
+    indices = torch.randint(points.shape[0], (subsample,))
+    return points.index_select(0, indices), frame["t"]
+
+
 def optimize_shape(
     decoder, frame, c_s, c_m, specs, num_iterations, device,
 ):
+    _project_code_norm_(c_s, specs.get("CodeBound"))
     c_s.requires_grad_(True)
     optimizer = torch.optim.Adam([c_s], lr=5e-3)
     final_error = math.inf
     adjust_every = max(num_iterations // 2, 1)
     for iteration in range(num_iterations):
         optimizer.param_groups[0]["lr"] = 5e-3 * (0.1 ** (iteration // adjust_every))
-        samples, time_value = get_sdf_samples_test(frame["npz"], specs["SamplesPerScene"])
+        samples, time_value = _sample_sdf_frame(frame, specs["SamplesPerScene"])
         xyz = samples[None, :, :3].to(device)
         sdf_gt = samples[:, 3:4].to(device)
         time = torch.tensor([time_value], dtype=torch.float32, device=device)
@@ -131,6 +152,7 @@ def optimize_shape(
         loss = sdf_loss + 1e-4 * torch.mean(c_s.square())
         loss.backward()
         optimizer.step()
+        _project_code_norm_(c_s, specs.get("CodeBound"))
         final_error = float(sdf_loss.detach())
     return final_error
 
@@ -145,13 +167,14 @@ def optimize_motion_batch(
         raise ValueError("Reference phase must be optimized separately")
     c_s.requires_grad_(False)
     cm_batch = c_m[indices].detach().clone().requires_grad_(True)
+    _project_code_norm_(cm_batch, specs.get("CodeBound"))
     optimizer = torch.optim.Adam([cm_batch], lr=5e-4)
     adjust_every = max(num_iterations // 2, 1)
     final_errors = None
     for iteration in range(num_iterations):
         optimizer.param_groups[0]["lr"] = 5e-4 * (0.1 ** (iteration // adjust_every))
         sampled = [
-            get_sdf_samples_test(frame["npz"], specs["SamplesPerScene"])
+            _sample_sdf_frame(frame, specs["SamplesPerScene"])
             for frame in frames
         ]
         samples = torch.stack([item[0] for item in sampled]).to(device)
@@ -170,6 +193,7 @@ def optimize_motion_batch(
         loss = torch.sum(final_errors + 1e-4 * cm_batch.square().mean(dim=1))
         loss.backward()
         optimizer.step()
+        _project_code_norm_(cm_batch, specs.get("CodeBound"))
     with torch.no_grad():
         c_m[indices] = cm_batch.detach()
     return {
@@ -293,6 +317,7 @@ def run_case_inference(config: CaseConfig, preprocess_report: dict) -> dict:
     mapping = preprocess_report["phase_mapping"]
     output_root = config.output_dir
     results, model_metadata, effective_batches = [], {}, {}
+    latent_code_diagnostics = {}
     for surface in SURFACES:
         decoder, specs, checkpoint_metadata = load_decoder(
             surface, config.checkpoints[surface], device
@@ -307,6 +332,8 @@ def run_case_inference(config: CaseConfig, preprocess_report: dict) -> dict:
         c_m = torch.empty(len(frames), specs["CmLength"], device=device).normal_(
             0, 1 / math.sqrt(specs["CmLength"])
         )
+        _project_code_norm_(c_s, specs.get("CodeBound"))
+        _project_code_norm_(c_m, specs.get("CodeBound"))
         shape_error = optimize_shape(
             decoder, frames[0], c_s, c_m, specs, config.num_iterations, device
         )
@@ -358,13 +385,34 @@ def run_case_inference(config: CaseConfig, preprocess_report: dict) -> dict:
                 "mesh": str(output_path),
                 "status": status,
             })
-        codes_dir = output_root / "artifacts" / "codes" / surface
-        _atomic_torch_save(
-            c_s.detach().cpu(), codes_dir / f"{config.case_id}_{surface}_cs.pth"
-        )
-        _atomic_torch_save(
-            c_m.detach().cpu(), codes_dir / f"{config.case_id}_{surface}_cm.pth"
-        )
+        codes_dir = output_root / "codes" / surface
+        cs_path = codes_dir / f"{config.case_id}_{surface}_cs.pth"
+        cm_path = codes_dir / f"{config.case_id}_{surface}_cm.pth"
+        _atomic_torch_save(c_s.detach().cpu(), cs_path)
+        _atomic_torch_save(c_m.detach().cpu(), cm_path)
+        motion_norms = torch.linalg.vector_norm(c_m.detach(), dim=1)
+        non_reference_norms = motion_norms[1:]
+        latent_code_diagnostics[surface] = {
+            "code_bound": (
+                float(specs["CodeBound"])
+                if specs.get("CodeBound") is not None else None
+            ),
+            "shape_norm": float(torch.linalg.vector_norm(c_s.detach())),
+            "motion_norm_reference": float(motion_norms[0]),
+            "motion_norm_non_reference_min": (
+                float(non_reference_norms.min())
+                if non_reference_norms.numel() else None
+            ),
+            "motion_norm_non_reference_max": (
+                float(non_reference_norms.max())
+                if non_reference_norms.numel() else None
+            ),
+            "motion_norm_max": float(motion_norms.max()),
+            "files": {
+                "shape": str(cs_path),
+                "motion": str(cm_path),
+            },
+        }
         del decoder
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
@@ -373,6 +421,7 @@ def run_case_inference(config: CaseConfig, preprocess_report: dict) -> dict:
         "device": device,
         "models": model_metadata,
         "effective_motion_batches": effective_batches,
+        "latent_codes": latent_code_diagnostics,
         "results": results,
         "all_passed": all(
             np.isfinite(item["error"]) and item["vertices"] > 0 and item["faces"] > 0

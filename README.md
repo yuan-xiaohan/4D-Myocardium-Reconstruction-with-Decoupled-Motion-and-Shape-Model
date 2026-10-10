@@ -1,35 +1,30 @@
-# 4D Myocardium Reconstruction
+# 4D Myocardium Reconstruction (4DMM)
 
 [4D Myocardium Reconstruction with Decoupled Motion and Shape Model (ICCV 2023)](https://openaccess.thecvf.com/content/ICCV2023/papers/Yuan_4D_Myocardium_Reconstruction_with_Decoupled_Motion_and_Shape_Model_ICCV_2023_paper.pdf)
 
 <div align="center">
-  <img src="images/teaser.jpg" alt="Teaser: 4D myocardium reconstruction with decoupled motion and shape models" width="50%">
+  <img src="images/teaser.jpg" alt="4D myocardium reconstruction with decoupled motion and shape models" width="50%">
 </div>
 
-> [!IMPORTANT]
-> **🚀 NEW — Endo/epi 4DMM release pipeline**
->
-> This release keeps the original 4DMM decoder and latent optimization while
-> adding independent endocardial and epicardial models, mask preprocessing,
-> base stitching, labeled VTK output, and fixed-camera videos.
+This repository provides training and end-to-end inference for 4D myocardium
+reconstruction. The inference pipeline reconstructs endocardial and epicardial
+surfaces from a cardiac mask sequence and produces labeled meshes, latent
+codes, reports, and contour-overlay videos.
 
-The repository provides both model training and case inference. Endo and epi
-are always separate models, checkpoints, and latent codes; users do not need to
-run two commands to process them.
-
-## Environment
+## Installation
 
 ```bash
 conda env create -f environment.yml
 conda activate 4DMM-release
 ```
 
-Run commands from the repository root. Each public entry point supports
-`--help` and can be used with or without a configuration file override.
+Run all commands from the repository root.
 
-## Inference from masks
+## Inference
 
-Put one case below `inputs/`:
+### Input
+
+Create one `masks` directory for each case:
 
 ```text
 inputs/
@@ -40,45 +35,34 @@ inputs/
         └── ...
 ```
 
-Each NIfTI frame must use the labels `0=background`, `1=RV cavity`,
-`2=LV myocardium`, and `3=LV cavity`. Frames from one case must have matching
-image geometry. The default reference frame is `0`; change it per case in
-`configs/cases.json` when ED has another frame number.
+Mask labels are `0=background`, `1=RV cavity`, `2=LV myocardium`, and
+`3=LV cavity`. All frames in a case must have matching image geometry. The
+validated workflow uses phase `00` as the end-diastolic temporal reference.
 
-The default model settings are 2000 optimization iterations, motion batch size
-4, and mesh resolution 64. They can be overridden independently for each case.
-The bundled ACDC models are inference-only. To run all discovered cases:
+### Run
+
+Run every discovered case:
 
 ```bash
 python run_pipeline.py
 ```
 
-To run only one discovered case:
+Run one case:
 
 ```bash
 python run_pipeline.py --case CaseA
 ```
 
-Endo and epi inference runs automatically on the selected device. The pipeline
-preprocesses the masks, optimizes both surfaces, stitches their base boundaries,
-and writes one labeled VTK mesh per frame.
+Use `--config`, `--input-root`, and `--output-root` for custom locations. Run
+`python run_pipeline.py --help` for the complete command-line interface.
 
-Default output:
+The pipeline preprocesses the masks, reconstructs endo and epi, stitches the
+base boundaries, validates the meshes, and renders the overlay video. Invalid
+meshes cause the case to fail instead of being written as successful output.
 
-```text
-outputs/CaseA/
-├── vtk/frame_*.vtk
-├── Mesh_video/CaseA_4DMM.mp4   # when video is enabled
-└── report.json
-```
+### Configuration
 
-Intermediate point clouds, NPZ files, raw OBJ files, and latent codes are
-removed after a successful run. Set `retain_artifacts` to `true` in the case
-configuration when those files are needed for debugging or a staged rerun.
-
-## Case configuration
-
-`configs/cases.json` supplies defaults and optional per-case overrides:
+Defaults and per-case overrides are read from `configs/cases.json`:
 
 ```json
 {
@@ -89,28 +73,53 @@ configuration when those files are needed for debugging or a staged rerun.
     "num_iterations": 2000,
     "phase_batch_size": 4,
     "resolution": 64,
-    "retain_artifacts": false,
-    "stages": {
-      "preprocess": true,
-      "inference": true,
-      "postprocess": true,
-      "video": true
-    }
+    "device": "auto",
+    "retain_artifacts": false
   },
   "cases": {
-    "CaseB": {"reference_phase": 2},
-    "CaseC": {"num_iterations": 1000, "stages": {"video": false}}
+    "CaseA": {"mirror": "normal"}
   }
 }
 ```
 
-The model paths are already set to `examples/acdc/4DMM/{endo,epi}`. A trained
-user model can be selected by changing the two checkpoint paths for a case.
+`mirror` controls whether the anatomy is reflected during alignment.
+`slice_order` controls whether the slices run from apex to base (`atob`) or
+base to apex (`btoa`). Both accept `auto`.
+
+> **Troubleshooting:** If the input contours look correct but the reconstructed
+> mesh is severely distorted or misplaced, check `mirror` and `slice_order`
+> first. An incorrect value or automatic estimate can cause major
+> reconstruction errors. The selected settings are recorded in `report.json`.
+
+### Output
+
+```text
+outputs/CaseA/
+├── vtk/frame_*.vtk
+├── Mesh_video/
+│   ├── CaseA_4DMM.mp4
+│   └── CaseA_phase_00.png
+├── codes/
+│   ├── endo/CaseA_endo_cs.pth
+│   ├── endo/CaseA_endo_cm.pth
+│   ├── epi/CaseA_epi_cs.pth
+│   └── epi/CaseA_epi_cm.pth
+└── report.json
+```
+
+Each VTK contains both surfaces: `surface_id=0` is epi and `surface_id=1` is
+endo. The corresponding `label` values are `1` and `2`. The normalization
+transform (`P`, `Pi`, `offset`, and `scale`) is stored under
+`preprocess.transform` in `report.json`.
+
+Latent codes are retained under `codes/`. Intermediate point clouds, NPZ files,
+and raw OBJ files are removed after a successful run unless
+`retain_artifacts=true`. The video stage requires a working off-screen OpenGL
+backend on headless systems.
 
 ## Training
 
-Training uses prepared canonical triangle meshes, not inference masks. Place the
-training data in this layout:
+Training uses canonical triangle meshes and their normalization transforms:
 
 ```text
 training_data/
@@ -121,53 +130,17 @@ training_data/
 └── P/P_lv/CaseA.txt
 ```
 
-Run the preparation step first. It creates the training files used by both
-surfaces:
+Prepare the data and start training:
 
 ```bash
 python process_data.py
-```
-
-Use `--case`, `--phase`, or `--surface` to prepare a subset when needed.
-
-Then edit `configs/training.json` if needed and start the unified trainer:
-
-```bash
 python train_4dmm.py
 ```
 
-Common settings can also be overridden directly, for example:
-
-```bash
-python train_4dmm.py --target-epoch 100 --batch-size 8
-```
-
-The default target is 50 epochs, batch size 16, and 8000 samples per scene.
-With two visible GPUs, endo and epi train independently in parallel; with one
-GPU or CPU they run sequentially. A training run is written to:
-
-```text
-outputs/training/<run-id>/
-├── endo/
-│   ├── ModelParameters/latest.pth
-│   ├── OptimizerParameters/latest.pth
-│   ├── LatentCodes/latest_cs.pth
-│   ├── LatentCodes/latest_cm.pth
-│   ├── specs.json
-│   ├── history.csv
-│   └── loss_curve.png
-├── epi/
-│   └── ...
-└── report.json
-```
-
-Training starts from scratch by default; set `initialization_mode` to `resume`
-only to continue one of your own saved runs. The bundled ACDC models do not
-contain optimizer state and cannot be used as training resume checkpoints.
+Training options are defined in `configs/training.json` and are also available
+through `python train_4dmm.py --help`. Endo and epi train independently.
 
 ## Attribution
-
-The decoder and core 4DMM formulation are based on:
 
 ```bibtex
 @inproceedings{yuan2023myo4d,
