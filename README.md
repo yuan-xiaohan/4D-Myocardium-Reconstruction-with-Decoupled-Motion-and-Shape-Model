@@ -6,10 +6,15 @@
   <img src="images/teaser.jpg" alt="4D myocardium reconstruction with decoupled motion and shape models" width="50%">
 </div>
 
-This repository provides training and end-to-end inference for 4D myocardium
-reconstruction. The inference pipeline reconstructs endocardial and epicardial
-surfaces from a cardiac mask sequence and produces labeled meshes, latent
-codes, reports, and contour-overlay videos.
+> [!IMPORTANT]
+> **🚀 NEW — Endo/epi 4DMM release pipeline**
+>
+> This release keeps the original 4DMM decoder and latent optimization while
+> adding independent endocardial and epicardial models, mask preprocessing,
+> base stitching, labeled VTK output, and fixed-camera videos.
+
+Given a sequence of 3D cardiac segmentation masks, the pipeline reconstructs
+the left-ventricular myocardium as a 3D mesh at every cardiac phase.
 
 ## Installation
 
