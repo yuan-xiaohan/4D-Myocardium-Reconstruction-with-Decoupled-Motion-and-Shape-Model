@@ -19,7 +19,7 @@
       "preprocess": true,
       "inference": true,
       "postprocess": true,
-      "video": true
+      "video": false
     }
   },
   "cases": {}

@@ -27,18 +27,24 @@ Run all commands from the repository root.
 
 ## Inference
 
+The bundled endocardial and epicardial checkpoints were trained on the
+official ACDC training set and evaluated on the held-out ACDC test set.
+
 ### Input
 
-Create one `masks` directory for each case:
+Place each case's mask sequence in its own directory:
 
 ```text
 inputs/
 └── CaseA/
-    └── masks/
+    └── mask/
         ├── 00.nii.gz
         ├── 01.nii.gz
         └── ...
 ```
+
+The alternative layout `inputs/mask/<case>/*.nii.gz` is also supported;
+`mask` and `masks` are interchangeable.
 
 Mask labels are `0=background`, `1=RV cavity`, `2=LV myocardium`, and
 `3=LV cavity`. All frames in a case must have matching image geometry. The
@@ -46,104 +52,100 @@ validated workflow uses phase `00` as the end-diastolic temporal reference.
 
 ### Run
 
-Run every discovered case:
+Run all discovered cases, or select one:
 
 ```bash
 python run_pipeline.py
-```
-
-Run one case:
-
-```bash
 python run_pipeline.py --case CaseA
 ```
 
 Use `--config`, `--input-root`, and `--output-root` for custom locations. Run
 `python run_pipeline.py --help` for the complete command-line interface.
 
-The pipeline preprocesses the masks, reconstructs endo and epi, stitches the
-base boundaries, validates the meshes, and renders the overlay video. Invalid
-meshes cause the case to fail instead of being written as successful output.
-
-### Configuration
-
-Defaults and per-case overrides are read from `configs/cases.json`:
-
-```json
-{
-  "default": {
-    "reference_phase": 0,
-    "mirror": "auto",
-    "slice_order": "auto",
-    "num_iterations": 2000,
-    "phase_batch_size": 4,
-    "resolution": 64,
-    "device": "auto",
-    "retain_artifacts": false
-  },
-  "cases": {
-    "CaseA": {"mirror": "normal"}
-  }
-}
-```
-
-`mirror` controls whether the anatomy is reflected during alignment.
-`slice_order` controls whether the slices run from apex to base (`atob`) or
-base to apex (`btoa`). Both accept `auto`.
-
-> **Troubleshooting:** If the input contours look correct but the reconstructed
-> mesh is severely distorted or misplaced, check `mirror` and `slice_order`
-> first. An incorrect value or automatic estimate can cause major
-> reconstruction errors. The selected settings are recorded in `report.json`.
+Settings and per-case overrides are in [configs/cases.json](configs/cases.json).
+Anatomical reflection (`mirror`) and apex-to-base slice direction (`slice_order`)
+are estimated automatically. If the mesh is severely distorted or misplaced,
+check these estimates in `report.json` and override them if needed.
 
 ### Output
 
 ```text
 outputs/CaseA/
 ├── vtk/frame_*.vtk
-├── Mesh_video/
-│   ├── CaseA_4DMM.mp4
-│   └── CaseA_phase_00.png
 ├── codes/
-│   ├── endo/CaseA_endo_cs.pth
-│   ├── endo/CaseA_endo_cm.pth
-│   ├── epi/CaseA_epi_cs.pth
-│   └── epi/CaseA_epi_cm.pth
 └── report.json
 ```
 
-Each VTK contains both surfaces: `surface_id=0` is epi and `surface_id=1` is
-endo. The corresponding `label` values are `1` and `2`. The normalization
-transform (`P`, `Pi`, `offset`, and `scale`) is stored under
-`preprocess.transform` in `report.json`.
+Outputs include labeled meshes, shape/motion codes, and a report containing
+the normalization transform and processing results. Mesh labels follow the
+fixed interface described below.
 
-Latent codes are retained under `codes/`. Intermediate point clouds, NPZ files,
-and raw OBJ files are removed after a successful run unless
-`retain_artifacts=true`. The video stage requires a working off-screen OpenGL
-backend on headless systems.
+If postprocessing fails for a phase, the pipeline saves the unchanged raw
+surfaces as a diagnostic VTK, retains codes and intermediate files, and reports
+the failure. Processing continues with subsequent phases.
 
-## Training
+Videos are disabled by default. Set `stages.video=true` to generate an overlay
+video and reference-frame PNG under `Mesh_video/` during the run.
 
-Training uses canonical triangle meshes and their normalization transforms:
+## Training on Your Own Data
+
+The model can be trained on a custom 4D cardiac dataset. Before training, each
+case must be converted to the required mesh interface:
 
 ```text
-training_data/
-├── obj_norm_uv/CaseA/
-│   ├── 00-endo.obj
-│   ├── 00-epi.obj
-│   └── ...
-└── P/P_lv/CaseA.txt
+Your Dataset/
+└── <case>/
+    ├── mask/
+    │   ├── 00.nii.gz
+    │   └── ...
+    ├── mesh/
+    │   ├── frame_00.vtk
+    │   └── ...
+    └── P.txt
 ```
+
+Every VTK frame must contain the fixed cell labels:
+
+```text
+surface_id: 0=epi, 1=endo
+label:      1=epi, 2=endo
+```
+
+`P.txt` stores one case-level normalization transform shared by every frame.
+If it is absent, `process_data.py` generates it once from the reference-phase
+Mask (phase 0 by default). If it is already present, the existing transform is
+reused. Masks are not needed for training when the meshes are labeled and
+`P.txt` is provided.
 
 Prepare the data and start training:
 
 ```bash
-python process_data.py
-python train_4dmm.py
+python process_data.py \
+  --dataset-root "/path/to/Your Dataset" \
+  --training-data-root training_data
+python train_4dmm.py --training-data-root training_data
 ```
 
-Training options are defined in `configs/training.json` and are also available
-through `python train_4dmm.py --help`. Endo and epi train independently.
+Endo and epi are trained independently; settings are in
+[configs/training.json](configs/training.json). See
+[training_data/README.md](training_data/README.md) for the alternative dataset
+layout and compatibility with separated normalized epi/endo OBJ files.
+
+## Optional Epi/Endo Labeling
+
+Users are encouraged to prepare and verify the epi/endo labels themselves. If
+a combined LV mesh has no labels, the optional helper can estimate them from
+the mesh and its corresponding Mask:
+
+```bash
+python split_epi_endo.py \
+  --mesh input.vtk \
+  --mask input.nii.gz \
+  --output labeled.vtk
+```
+
+The tool preserves points and faces. Its labels are heuristic and must be
+reviewed and, if necessary, corrected before training.
 
 ## Attribution
 

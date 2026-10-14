@@ -1,7 +1,7 @@
 # Third-party notices
 
 The minimal mask canonicalization in `preprocess_mask.py` is adapted from the
-standalone inference utilities developed for UVRecons. Only NIfTI validation,
+authors' earlier standalone cardiac inference utilities. Only NIfTI validation,
 contour extraction, rigid registration, and orientation scoring are retained.
 The standalone reconstruction and MRI-segmentation models are not included.
 

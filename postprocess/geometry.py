@@ -1,3 +1,5 @@
+"""Strict geometry construction for 4DMM base stitching."""
+
 from collections import defaultdict
 from itertools import product
 from pathlib import Path
@@ -5,6 +7,17 @@ from pathlib import Path
 import numpy as np
 import pyvista as pv
 from scipy.spatial import cKDTree
+
+from .contract import (
+    ENDO_LABEL,
+    EPI_LABEL,
+    POSTPROCESS_ALGORITHM_NAME,
+    POSTPROCESS_ALGORITHM_VERSION,
+    GeometryError,
+    radial_normal_score as _radial_normal_score,
+    triangle_faces as _triangle_faces,
+    validate_combined_mesh,
+)
 
 
 # Intentional seam vertices are exact coordinate copies. Keep the merge
@@ -16,21 +29,14 @@ CONTOUR_MAP_TOLERANCE_RATIO = 1.0e-6
 MAX_SECONDARY_CONTOUR_LENGTH_RATIO = 0.25
 MAX_ARTIFACT_AREA_RATIO = 0.005
 MAX_ARTIFACT_COMPONENTS = 12
+MAX_RAW_ARTIFACT_AREA_RATIO = 0.005
+MAX_RAW_ARTIFACT_COMPONENTS = 4
 MIN_BOUNDARY_TOUCH_FRACTION = 0.95
 MAX_NONBOUNDARY_TOUCH_FRACTION = 0.05
-MIN_NORMAL_ORIENTATION_SCORE = 0.10
-EPI_LABEL = 1
-ENDO_LABEL = 2
 APPROXIMATE_GAP95_EDGE_RATIO = 3.0
 APPROXIMATE_GAP_MAX_EDGE_RATIO = 6.0
 INDEPENDENT_GAP95_EDGE_RATIO = 3.0
 INDEPENDENT_GAP_MAX_EDGE_RATIO = 8.0
-POSTPROCESS_ALGORITHM_VERSION = 3
-POSTPROCESS_ALGORITHM_NAME = "independent_base_zero_level_loops"
-
-
-class GeometryError(RuntimeError):
-    pass
 
 
 def _load_surface(path):
@@ -41,16 +47,6 @@ def _load_surface(path):
     if mesh.n_points == 0 or mesh.n_cells == 0:
         raise GeometryError(f"Empty mesh: {path}")
     return mesh
-
-
-def _triangle_faces(mesh):
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    if faces.size == 0 or faces.size % 4:
-        raise GeometryError("Expected a non-empty triangular PolyData surface")
-    faces = faces.reshape(-1, 4)
-    if not np.all(faces[:, 0] == 3):
-        raise GeometryError("Non-triangular faces remain after triangulation")
-    return faces[:, 1:]
 
 
 def _line_segments(polyline):
@@ -526,6 +522,65 @@ def _surface_components(mesh):
         )
     result.sort(key=lambda component: float(component.area), reverse=True)
     return result
+
+
+def _raw_main_component(mesh, surface):
+    components = _surface_components(mesh)
+    areas = np.asarray(
+        [float(component.area) for component in components],
+        dtype=np.float64,
+    )
+    total_area = float(np.sum(areas))
+    if not np.isfinite(areas).all() or total_area <= 0.0:
+        raise GeometryError(
+            f"{surface.capitalize()} raw surface has invalid component area"
+        )
+
+    artifacts = components[1:]
+    for index, artifact in enumerate(artifacts, start=1):
+        if artifact.n_open_edges != 0 or not artifact.is_manifold:
+            raise GeometryError(
+                f"{surface.capitalize()} raw surface secondary component "
+                f"{index} must be closed and manifold: "
+                f"open_edges={artifact.n_open_edges}, "
+                f"manifold={artifact.is_manifold}"
+            )
+
+    artifact_area = float(np.sum(areas[1:]))
+    artifact_ratio = artifact_area / total_area
+    if artifact_ratio > MAX_RAW_ARTIFACT_AREA_RATIO:
+        raise GeometryError(
+            f"{surface.capitalize()} raw surface contains non-negligible "
+            f"secondary components: area_ratio={artifact_ratio:.6f}"
+        )
+    return components[0], {
+        "input_component_count": len(components),
+        "removed_component_count": len(artifacts),
+        "removed_area": artifact_area,
+        "removed_area_ratio": artifact_ratio,
+        "component_areas": areas.tolist(),
+    }
+
+
+def _remove_raw_surface_artifacts(raw_epi, raw_endo):
+    epi, epi_diagnostics = _raw_main_component(raw_epi, "epi")
+    endo, endo_diagnostics = _raw_main_component(raw_endo, "endo")
+    removed_count = (
+        epi_diagnostics["removed_component_count"]
+        + endo_diagnostics["removed_component_count"]
+    )
+    if removed_count > MAX_RAW_ARTIFACT_COMPONENTS:
+        raise GeometryError(
+            "Raw surface pair contains too many secondary components: "
+            f"count={removed_count}"
+        )
+    return epi, endo, {
+        "epi": epi_diagnostics,
+        "endo": endo_diagnostics,
+        "combined_removed_component_count": removed_count,
+        "area_ratio_limit": MAX_RAW_ARTIFACT_AREA_RATIO,
+        "component_count_limit": MAX_RAW_ARTIFACT_COMPONENTS,
+    }
 
 
 def _largest_surface_component(mesh):
@@ -1176,7 +1231,6 @@ def _select_independent_base_parts(raw_epi, raw_endo):
         diagnostics,
     )
 
-
 def _midpoint_common_loop(
     epi_mesh,
     epi_boundary_ids,
@@ -1356,26 +1410,6 @@ def _approximate_clip_and_bridge(raw_epi, raw_endo, contour):
     return epi_bridged, endo_bridged, diagnostics
 
 
-def _radial_normal_score(mesh, center=None):
-    oriented = mesh.compute_normals(
-        cell_normals=True,
-        point_normals=False,
-        split_vertices=False,
-        consistent_normals=True,
-        auto_orient_normals=False,
-        non_manifold_traversal=True,
-    )
-    cell_centers = np.asarray(oriented.cell_centers().points)
-    normals = np.asarray(oriented.cell_data["Normals"])
-    if center is None:
-        center = np.asarray(mesh.center)
-    radial = cell_centers - np.asarray(center).reshape(1, 3)
-    lengths = np.linalg.norm(radial, axis=1)
-    valid = lengths > 1.0e-12
-    radial[valid] /= lengths[valid, None]
-    return float(np.mean(np.sum(normals[valid] * radial[valid], axis=1)))
-
-
 def _orient_surface(mesh, outward):
     oriented = mesh.compute_normals(
         cell_normals=True,
@@ -1473,110 +1507,6 @@ def _assign_surface_ids(merged, epi, endo):
     return merged
 
 
-def _surface_from_id(mesh, surface_id):
-    ids = np.asarray(mesh.cell_data["surface_id"])
-    cell_ids = np.flatnonzero(ids == surface_id)
-    if cell_ids.size == 0:
-        raise GeometryError(f"Missing surface_id={surface_id}")
-    return (
-        mesh.extract_cells(cell_ids)
-        .extract_surface()
-        .triangulate()
-        .clean()
-    )
-
-
-def validate_combined_mesh(mesh):
-    mesh = mesh.extract_surface().triangulate()
-    if mesh.n_points == 0 or mesh.n_cells == 0:
-        raise GeometryError("Combined mesh is empty")
-    points = np.asarray(mesh.points, dtype=np.float64)
-    if not np.isfinite(points).all():
-        raise GeometryError("Combined mesh contains NaN or infinite points")
-    faces = _triangle_faces(mesh)
-    if np.any(faces < 0) or np.any(faces >= mesh.n_points):
-        raise GeometryError("Combined mesh contains an invalid face index")
-    if mesh.n_open_edges != 0:
-        raise GeometryError(
-            f"Combined mesh has {mesh.n_open_edges} open edges"
-        )
-    if not mesh.is_manifold:
-        raise GeometryError("Combined mesh is not manifold")
-    if "postprocess_algorithm_version" not in mesh.field_data:
-        raise GeometryError(
-            "Combined mesh was produced by an obsolete postprocess "
-            "algorithm"
-        )
-    algorithm_version = int(
-        np.asarray(
-            mesh.field_data["postprocess_algorithm_version"]
-        ).reshape(-1)[0]
-    )
-    if algorithm_version != POSTPROCESS_ALGORITHM_VERSION:
-        raise GeometryError(
-            "Combined mesh postprocess algorithm version is obsolete: "
-            f"found={algorithm_version}, "
-            f"expected={POSTPROCESS_ALGORITHM_VERSION}"
-        )
-    if "surface_id" not in mesh.cell_data:
-        raise GeometryError("Combined mesh has no surface_id cell array")
-
-    surface_ids = np.asarray(mesh.cell_data["surface_id"]).astype(int)
-    unique_ids = set(int(value) for value in np.unique(surface_ids))
-    if unique_ids != {0, 1}:
-        raise GeometryError(
-            f"Expected surface_id values {{0, 1}}, got {unique_ids}"
-        )
-    if "label" not in mesh.cell_data:
-        raise GeometryError("Combined mesh has no cell label array")
-    cell_labels = np.asarray(mesh.cell_data["label"]).astype(int)
-    if not np.array_equal(cell_labels, surface_ids + EPI_LABEL):
-        raise GeometryError(
-            "Cell label is inconsistent with surface_id; expected "
-            "epi=1 and endo=2"
-        )
-    if "label" not in mesh.point_data:
-        raise GeometryError("Combined mesh has no point label array")
-    point_labels = np.asarray(mesh.point_data["label"]).astype(int)
-    point_label_values = set(
-        int(value) for value in np.unique(point_labels)
-    )
-    if point_label_values != {EPI_LABEL, ENDO_LABEL}:
-        raise GeometryError(
-            "Expected point label values {1, 2}, got "
-            f"{point_label_values}"
-        )
-
-    epi = _surface_from_id(mesh, 0)
-    endo = _surface_from_id(mesh, 1)
-    epi_score = _radial_normal_score(epi)
-    endo_score = _radial_normal_score(endo)
-    if epi_score < MIN_NORMAL_ORIENTATION_SCORE:
-        raise GeometryError(
-            f"Epi normals are not outward: score={epi_score:.6f}"
-        )
-    if endo_score > -MIN_NORMAL_ORIENTATION_SCORE:
-        raise GeometryError(
-            f"Endo normals are not directed toward the chamber: "
-            f"score={endo_score:.6f}"
-        )
-    return {
-        "n_points": int(mesh.n_points),
-        "n_cells": int(mesh.n_cells),
-        "finite_points": True,
-        "triangular_faces": True,
-        "valid_face_indices": True,
-        "n_open_edges": int(mesh.n_open_edges),
-        "is_manifold": bool(mesh.is_manifold),
-        "epi_cells": int(epi.n_cells),
-        "endo_cells": int(endo.n_cells),
-        "epi_label": EPI_LABEL,
-        "endo_label": ENDO_LABEL,
-        "epi_outward_score": epi_score,
-        "endo_outward_score": endo_score,
-    }
-
-
 def _validate_raw_surface_roles(raw_epi, raw_endo):
     if raw_epi.n_open_edges != 0 or not raw_epi.is_manifold:
         raise GeometryError(
@@ -1627,12 +1557,16 @@ def _finalize_surface_pair(
 def clip_and_merge_surface_pair(epi_path, endo_path):
     raw_epi = _load_surface(epi_path)
     raw_endo = _load_surface(endo_path)
+    raw_epi, raw_endo, cleanup_diagnostics = (
+        _remove_raw_surface_artifacts(raw_epi, raw_endo)
+    )
     _validate_raw_surface_roles(raw_epi, raw_endo)
     epi_kept, endo_kept, independent_diagnostics = (
         _independent_zero_level_clip_and_bridge(raw_epi, raw_endo)
     )
     diagnostics = {
         **independent_diagnostics,
+        "raw_component_cleanup": cleanup_diagnostics,
         "processing_mode": POSTPROCESS_ALGORITHM_NAME,
         "postprocess_algorithm_version": POSTPROCESS_ALGORITHM_VERSION,
     }

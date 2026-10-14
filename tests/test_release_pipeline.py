@@ -270,6 +270,136 @@ class PreprocessTests(unittest.TestCase):
             self.assertEqual(report["inference"]["results"][0], {"error": 0.1})
             self.assertEqual(report["preprocess"]["transform"]["P"], np.eye(4).tolist())
 
+    def test_postprocess_fallback_keeps_codes_artifacts_and_renders_video(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            (output / "artifacts" / "raw").mkdir(parents=True)
+            (output / "artifacts" / "raw" / "marker.txt").write_text("raw")
+            (output / "codes" / "endo").mkdir(parents=True)
+            code_path = output / "codes" / "endo" / "Fallback_endo_cs.pth"
+            code_path.write_bytes(b"code")
+            config = CaseConfig(
+                case_id="Fallback",
+                input_mask_dir=root / "masks",
+                output_dir=output,
+                enabled=True,
+                reference_phase=0,
+                mirror="normal",
+                slice_order="auto",
+                num_iterations=1,
+                phase_batch_size=1,
+                resolution=32,
+                preprocess_mode="mask",
+                prepared_root=None,
+                device="cpu",
+                skip_existing=False,
+                retain_artifacts=False,
+                video_order="original",
+                checkpoints={"endo": root, "epi": root},
+                stages={
+                    "preprocess": True,
+                    "inference": True,
+                    "postprocess": True,
+                    "video": True,
+                },
+            )
+            preprocess = {
+                "case_id": "Fallback",
+                "all_passed": True,
+                "original_phases": [0],
+                "phase_mapping": [
+                    {"original_phase": 0, "internal_phase": 0, "t": 0.0}
+                ],
+                "orientation": {},
+                "manifests": {"endo": "temporary", "epi": "temporary"},
+                "transform": {
+                    "P": np.eye(4).tolist(),
+                    "Pi": np.eye(4).tolist(),
+                    "offset": [0.0, 0.0, 0.0],
+                    "scale": 1.0,
+                },
+            }
+            fallback_report = {
+                "all_passed": False,
+                "all_outputs_written": True,
+                "strict_passed_count": 0,
+                "raw_concat_count": 1,
+                "missing_output_count": 0,
+                "results": [{
+                    "phase": 0,
+                    "status": "strict_failed_raw_concat_written",
+                    "strict_postprocess_passed": False,
+                    "output": str(output / "vtk" / "frame_00.vtk"),
+                    "strict_error": "strict failure",
+                }],
+            }
+            with mock.patch(
+                "run_pipeline.run_preprocessing", return_value=preprocess
+            ), mock.patch(
+                "run_pipeline.run_case_inference",
+                return_value={
+                    "all_passed": True,
+                    "results": [{"mesh": "retained raw mesh"}],
+                },
+            ), mock.patch(
+                "run_pipeline.run_case_postprocess",
+                return_value=fallback_report,
+            ), mock.patch(
+                "run_pipeline.run_case_video",
+                return_value={
+                    "all_passed": True,
+                    "contains_diagnostic_frames": True,
+                    "raw_concat_phases": [0],
+                },
+            ) as video:
+                report = run_case(config)
+            self.assertEqual(
+                report["status"], "completed_with_postprocess_failures"
+            )
+            self.assertEqual(
+                report["stages"]["video"]["status"],
+                "completed",
+            )
+            self.assertTrue(
+                report["stages"]["video"]["contains_diagnostic_frames"]
+            )
+            self.assertEqual(report["video"]["raw_concat_phases"], [0])
+            self.assertEqual(report["postprocess"], fallback_report)
+            self.assertTrue((output / "artifacts" / "raw" / "marker.txt").is_file())
+            self.assertTrue(code_path.is_file())
+            self.assertEqual(
+                report["inference"]["results"][0]["mesh"],
+                "retained raw mesh",
+            )
+            video.assert_called_once_with(config, preprocess)
+
+            with mock.patch(
+                "run_pipeline.run_preprocessing", return_value=preprocess
+            ), mock.patch(
+                "run_pipeline.run_case_inference",
+                return_value={
+                    "all_passed": True,
+                    "results": [{"mesh": "retained raw mesh"}],
+                },
+            ), mock.patch(
+                "run_pipeline.run_case_postprocess",
+                return_value=fallback_report,
+            ), mock.patch(
+                "run_pipeline.run_case_video",
+                side_effect=RuntimeError("video failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "video failed"):
+                    run_case(config)
+            with (output / "report.json").open(encoding="utf-8") as handle:
+                failed_report = json.load(handle)
+            self.assertEqual(failed_report["status"], "failed")
+            self.assertEqual(failed_report["postprocess"], fallback_report)
+            self.assertIsNotNone(failed_report["inference"])
+            self.assertEqual(
+                failed_report["stages"]["video"]["status"], "failed"
+            )
+
     def test_reference_phase_rotation(self):
         mapping = phase_mapping([0, 1, 2, 3], 2)
         self.assertEqual([item["original_phase"] for item in mapping], [2, 3, 0, 1])

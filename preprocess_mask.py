@@ -649,6 +649,74 @@ def _transform_text(p: np.ndarray, pi: np.ndarray, offset: np.ndarray, scale: fl
     return "\n".join(rows)
 
 
+def compute_mask_transform(
+    mask_dir: Path,
+    reference_phase: int = 0,
+    mirror: str = "auto",
+    slice_order: str = "auto",
+    asset_path: Path = REGISTRATION_ASSET,
+) -> dict:
+    """Compute one case-level normalization transform from a reference Mask."""
+    frames = discover_frames(Path(mask_dir))
+    frame_by_phase = {frame.phase: frame for frame in frames}
+    if reference_phase not in frame_by_phase:
+        raise ValueError(
+            f"Reference phase {reference_phase} is absent from {mask_dir}"
+        )
+    reference_path = frame_by_phase[reference_phase].path
+    validate_labels(reference_path, (1, 2, 3))
+    assets = load_registration_assets(Path(asset_path))
+    contours = extract_contours(reference_path, slice_order)
+    registration, orientation = choose_registration(
+        RigidRegistrar(assets), contours, reference_path, mirror
+    )
+    # Persist exactly the rounded matrix used by inference and derive Pi from
+    # that representation so a generated P.txt is identical to pipeline use.
+    persisted_p = np.round(np.asarray(registration.rigid, dtype=np.float64), 6)
+    transform = {
+        "P": persisted_p,
+        "Pi": np.linalg.inv(persisted_p),
+        "offset": np.asarray(registration.offset, dtype=np.float64),
+        "scale": float(registration.scale),
+    }
+    return {
+        "reference_phase": int(reference_phase),
+        "transform": transform,
+        "orientation": orientation,
+        "slice_order": contours.slice_order_info,
+        "registration_asset_sha256": assets.sha256,
+    }
+
+
+def write_mask_transform(
+    mask_dir: Path,
+    output_path: Path,
+    reference_phase: int = 0,
+    mirror: str = "auto",
+    slice_order: str = "auto",
+    asset_path: Path = REGISTRATION_ASSET,
+) -> dict:
+    """Compute and atomically write a reusable case-level P.txt."""
+    result = compute_mask_transform(
+        mask_dir=mask_dir,
+        reference_phase=reference_phase,
+        mirror=mirror,
+        slice_order=slice_order,
+        asset_path=asset_path,
+    )
+    transform = result["transform"]
+    _atomic_text(
+        Path(output_path),
+        _transform_text(
+            transform["P"],
+            transform["Pi"],
+            transform["offset"],
+            transform["scale"],
+        ),
+    )
+    return result
+
+
 def _read_transform(path: Path) -> dict:
     blocks, current, rows = {}, None, []
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -684,10 +752,10 @@ def _read_transform(path: Path) -> dict:
 
 def _prepared_sources(config: CaseConfig) -> tuple[list[int], dict, dict[tuple[int, str], Path]]:
     root = config.prepared_root
-    point_root = root / "input-points_norm_uv" / config.case_id
+    point_root = root / "normalized_points" / config.case_id
     if not point_root.is_dir():
         point_root = root / config.case_id if (root / config.case_id).is_dir() else root
-    p_path = root / "P" / "P_lv" / f"{config.case_id}.txt"
+    p_path = root / "P" / f"{config.case_id}.txt"
     if not p_path.is_file():
         p_path = root / f"{config.case_id}.txt"
     transform = _read_transform(p_path)
@@ -704,8 +772,8 @@ def _prepared_sources(config: CaseConfig) -> tuple[list[int], dict, dict[tuple[i
 
 def run_preprocessing(config: CaseConfig, asset_path: Path = REGISTRATION_ASSET) -> dict:
     preprocess_root = config.output_dir / "artifacts" / "preprocess"
-    points_root = preprocess_root / "input-points_norm_uv" / config.case_id
-    p_path = preprocess_root / "P" / "P_lv" / f"{config.case_id}.txt"
+    points_root = preprocess_root / "normalized_points" / config.case_id
+    p_path = preprocess_root / "P" / f"{config.case_id}.txt"
     npz_root = preprocess_root / "npz"
 
     labels_by_phase = {}
@@ -721,29 +789,17 @@ def run_preprocessing(config: CaseConfig, asset_path: Path = REGISTRATION_ASSET)
         for frame in frames:
             required = (1, 2, 3) if frame.phase == config.reference_phase else (2, 3)
             labels_by_phase[str(frame.phase)] = validate_labels(frame.path, required)
-        assets = load_registration_assets(asset_path)
-        asset_hash = assets.sha256
-        reference_contours = extract_contours(
-            frame_by_phase[config.reference_phase].path, config.slice_order
+        generated = compute_mask_transform(
+            mask_dir=config.input_mask_dir,
+            reference_phase=config.reference_phase,
+            mirror=config.mirror,
+            slice_order=config.slice_order,
+            asset_path=asset_path,
         )
-        registrar = RigidRegistrar(assets)
-        registration, orientation = choose_registration(
-            registrar,
-            reference_contours,
-            frame_by_phase[config.reference_phase].path,
-            config.mirror,
-        )
-        # The historical data contract stores P at six decimal places.  Pi
-        # must be derived from that exact persisted P, not from its unrounded
-        # optimizer result, so the text and NPZ representations stay aligned.
-        persisted_p = np.round(np.asarray(registration.rigid, dtype=np.float64), 6)
-        transform = {
-            "P": persisted_p,
-            "Pi": np.linalg.inv(persisted_p),
-            "offset": registration.offset,
-            "scale": registration.scale,
-        }
-        slice_order_info = reference_contours.slice_order_info
+        transform = generated["transform"]
+        orientation = generated["orientation"]
+        slice_order_info = generated["slice_order"]
+        asset_hash = generated["registration_asset_sha256"]
         sources = None
     else:
         phases, transform, sources = _prepared_sources(config)

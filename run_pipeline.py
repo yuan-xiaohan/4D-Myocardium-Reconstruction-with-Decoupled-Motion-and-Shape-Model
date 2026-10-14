@@ -11,7 +11,8 @@ import traceback
 from pathlib import Path
 
 from case_config import CaseConfig, load_case_configs
-from postprocess_base import run_case_postprocess
+from postprocess import run_case_postprocess
+from postprocess.video import run_case_video
 from preprocess_mask import load_preprocess_report, run_preprocessing
 from project_config import (
     CASE_CONFIG_PATH,
@@ -20,7 +21,6 @@ from project_config import (
     OUTPUT_ROOT,
 )
 from reconstruct_4dmm import run_case_inference
-from render_mesh_video import run_case_video
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -63,10 +63,51 @@ def _compact_inference_report(report: dict | None, retain_artifacts: bool) -> di
 def run_case(config: CaseConfig) -> dict:
     started = time.perf_counter()
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    stages = {}
-    inference_report = None
-    postprocess_report = None
-    video_report = None
+    existing_report = {}
+    report_path = config.output_dir / "report.json"
+    if report_path.is_file():
+        try:
+            existing_report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_report = {}
+    stages = dict(existing_report.get("stages") or {})
+    inference_report = existing_report.get("inference")
+    postprocess_report = existing_report.get("postprocess")
+    video_report = existing_report.get("video")
+    postprocess_has_failures = bool(
+        postprocess_report is not None
+        and not postprocess_report.get("all_passed", True)
+    )
+
+    def persist_report(status: str = "running") -> dict:
+        retain_artifacts = config.retain_artifacts or postprocess_has_failures
+        report = {
+            "case_id": config.case_id,
+            "status": status,
+            "seconds": time.perf_counter() - started,
+            "python": platform.python_version(),
+            "config": config.to_json(),
+            "phase_mapping": preprocess_report["phase_mapping"],
+            "orientation": preprocess_report["orientation"],
+            "stages": stages,
+            "preprocess": _compact_preprocess_report(
+                preprocess_report, retain_artifacts
+            ),
+            "inference": _compact_inference_report(
+                inference_report, retain_artifacts
+            ),
+            "postprocess": postprocess_report,
+            "video": video_report,
+        }
+        # A successful retry replaces, rather than inherits, a previous
+        # run-level failure.  Keep this explicit so error metadata cannot
+        # survive if report assembly changes to merge existing fields later.
+        if status in {"success", "completed_with_postprocess_failures"}:
+            for key in ("error", "error_type", "traceback"):
+                report.pop(key, None)
+        _atomic_json(config.output_dir / "report.json", report)
+        return report
+
     if config.stages["preprocess"]:
         preprocess_report = run_preprocessing(config)
         stages["preprocess"] = {
@@ -79,22 +120,9 @@ def run_case(config: CaseConfig) -> dict:
         preprocess_report = load_preprocess_report(config)
         stages["preprocess"] = {"status": "reused"}
 
-    # Persist the completed transform before inference/postprocess/video so a
-    # later stage failure never discards P/Pi.  This is replaced by the final
-    # compact report after the case succeeds.
-    _atomic_json(
-        config.output_dir / "report.json",
-        {
-            "case_id": config.case_id,
-            "status": "running",
-            "config": config.to_json(),
-            "orientation": preprocess_report["orientation"],
-            "preprocess": _compact_preprocess_report(
-                preprocess_report, config.retain_artifacts
-            ),
-            "stages": stages,
-        },
-    )
+    # Persist every completed stage so a later failure cannot discard the
+    # transform, latent-code report, or per-frame postprocess diagnostics.
+    persist_report()
 
     if config.stages["inference"]:
         inference_report = run_case_inference(config, preprocess_report)
@@ -106,45 +134,64 @@ def run_case(config: CaseConfig) -> dict:
         }
     else:
         stages["inference"] = {"status": "disabled"}
+        if inference_report is not None:
+            stages["inference"] = existing_report.get("stages", {}).get(
+                "inference", {"status": "reused"}
+            )
+    persist_report()
 
     if config.stages["postprocess"]:
         postprocess_report = run_case_postprocess(config, preprocess_report)
+        postprocess_has_failures = not postprocess_report["all_passed"]
         stages["postprocess"] = {
-            "status": "completed",
+            "status": (
+                "completed_with_failures"
+                if postprocess_has_failures
+                else "completed"
+            ),
             "phases": len(postprocess_report["results"]),
+            "strict_passed": postprocess_report.get("strict_passed_count"),
+            "raw_concat": postprocess_report.get("raw_concat_count"),
+            "missing_outputs": postprocess_report.get("missing_output_count"),
         }
     else:
         stages["postprocess"] = {"status": "disabled"}
+        if postprocess_report is not None:
+            stages["postprocess"] = existing_report.get("stages", {}).get(
+                "postprocess", {"status": "reused"}
+            )
+    persist_report()
 
     if config.stages["video"]:
-        video_report = run_case_video(config, preprocess_report)
-        stages["video"] = {"status": "completed", **video_report}
+        try:
+            video_report = run_case_video(config, preprocess_report)
+            stages["video"] = {"status": "completed", **video_report}
+        except Exception as error:
+            stages["video"] = {
+                "status": "failed",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+            persist_report(status="failed")
+            raise
     else:
         stages["video"] = {"status": "disabled"}
-
-    report = {
-        "case_id": config.case_id,
-        "status": "success",
-        "seconds": time.perf_counter() - started,
-        "python": platform.python_version(),
-        "config": config.to_json(),
-        "phase_mapping": preprocess_report["phase_mapping"],
-        "orientation": preprocess_report["orientation"],
-        "stages": stages,
-        "preprocess": _compact_preprocess_report(
-            preprocess_report, config.retain_artifacts
-        ),
-        "inference": _compact_inference_report(
-            inference_report, config.retain_artifacts
-        ),
-        "postprocess": postprocess_report,
-        "video": video_report,
-    }
-    _atomic_json(config.output_dir / "report.json", report)
+        if video_report is not None:
+            stages["video"] = existing_report.get("stages", {}).get(
+                "video", {"status": "reused"}
+            )
+    report = persist_report(
+        status=(
+            "completed_with_postprocess_failures"
+            if postprocess_has_failures
+            else "success"
+        )
+    )
     if (
         not config.retain_artifacts
         and config.stages["inference"]
         and config.stages["postprocess"]
+        and not postprocess_has_failures
     ):
         shutil.rmtree(config.output_dir / "artifacts", ignore_errors=True)
     return report
@@ -178,11 +225,34 @@ def run_all_cases(
         print(f"[case] starting {config.case_id}", flush=True)
         try:
             result = run_case(config)
-            results.append(result)
-            print(
-                f"[case] completed {config.case_id} in {result['seconds']:.1f}s",
-                flush=True,
-            )
+            if result["status"] == "success":
+                results.append(result)
+                print(
+                    f"[case] completed {config.case_id} in "
+                    f"{result['seconds']:.1f}s",
+                    flush=True,
+                )
+            else:
+                postprocess = result.get("postprocess") or {}
+                failure = {
+                    "case_id": config.case_id,
+                    "status": "failed",
+                    "error_type": "PostprocessFailure",
+                    "error": (
+                        "Strict postprocess failed for "
+                        f"{postprocess.get('raw_concat_count', 0)} frame(s); "
+                        f"missing outputs={postprocess.get('missing_output_count', 0)}"
+                    ),
+                    "report": str(config.output_dir / "report.json"),
+                }
+                failures.append(failure)
+                print(
+                    f"[case] completed_with_postprocess_failures "
+                    f"{config.case_id}: {failure['error']}",
+                    flush=True,
+                )
+                if not continue_on_error:
+                    break
         except Exception as error:
             failure = {
                 "case_id": config.case_id,
@@ -199,12 +269,17 @@ def run_all_cases(
                         partial_report = json.load(handle)
                 except (OSError, json.JSONDecodeError):
                     partial_report = {}
-            if partial_report.get("preprocess") is not None:
-                failure["preprocess"] = partial_report["preprocess"]
-            if partial_report.get("orientation") is not None:
-                failure["orientation"] = partial_report["orientation"]
-            if partial_report.get("stages") is not None:
-                failure["stages"] = partial_report["stages"]
+            for key in (
+                "phase_mapping",
+                "orientation",
+                "preprocess",
+                "inference",
+                "postprocess",
+                "video",
+                "stages",
+            ):
+                if partial_report.get(key) is not None:
+                    failure[key] = partial_report[key]
             failures.append(failure)
             failure["config"] = config.to_json()
             _atomic_json(config.output_dir / "report.json", failure)
@@ -232,7 +307,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--input-root", type=Path, default=INPUT_ROOT,
-        help="directory containing <case>/masks folders (default: inputs)",
+        help=(
+            "directory containing <case>/mask(s) or mask(s)/<case> "
+            "(default: inputs)"
+        ),
     )
     parser.add_argument(
         "--output-root", type=Path, default=OUTPUT_ROOT,

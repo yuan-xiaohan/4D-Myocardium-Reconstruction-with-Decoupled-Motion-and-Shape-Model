@@ -263,14 +263,17 @@ def _resolve_training_devices(config):
     return False, {surface: devices[0] for surface in enabled}
 
 
-def _surface_output_dir(run_id, surface, surface_config):
-    return OUTPUT_ROOT / "training" / run_id / surface
+def _surface_output_dir(run_id, surface, surface_config, output_root=None):
+    root = Path(output_root) if output_root is not None else OUTPUT_ROOT
+    return root / "training" / run_id / surface
 
 
-def _run_surface_from_config(config, surface, device, run_id):
+def _run_surface_from_config(
+    config, surface, device, run_id, training_data_root=None, output_root=None
+):
     """Run one independent surface, converting exceptions into a report."""
     surface_config = config["surfaces"][surface]
-    output_dir = _surface_output_dir(run_id, surface, surface_config)
+    output_dir = _surface_output_dir(run_id, surface, surface_config, output_root)
     result = {
         "surface": surface,
         "device": device,
@@ -295,7 +298,8 @@ def _run_surface_from_config(config, surface, device, run_id):
                     "start_epoch": completed_epoch + 1,
                 })
                 return result
-        manifest_path = TRAIN_MANIFEST_ROOT / f"data_load_{surface}.json"
+        manifest_root = Path(training_data_root) if training_data_root is not None else TRAIN_MANIFEST_ROOT
+        manifest_path = manifest_root / f"data_load_{surface}.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(
                 f"Training manifest is missing: {manifest_path}. Run process_data.py first."
@@ -330,9 +334,11 @@ def _run_surface_from_config(config, surface, device, run_id):
     return result
 
 
-def _training_worker(queue, config, surface, device, run_id):
+def _training_worker(queue, config, surface, device, run_id, training_data_root, output_root):
     try:
-        result = _run_surface_from_config(config, surface, device, run_id)
+        result = _run_surface_from_config(
+            config, surface, device, run_id, training_data_root, output_root
+        )
     except Exception as error:
         result = {
             "surface": surface,
@@ -352,7 +358,9 @@ def run_all_training(config=None, run_id=None):
     """Run enabled surfaces with automatic independent-device scheduling."""
     config = load_training_config() if config is None else config
     run_id = run_id or datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    summary_dir = OUTPUT_ROOT / "training" / run_id
+    training_data_root = config.get("_training_data_root", TRAIN_MANIFEST_ROOT)
+    output_root = config.get("_output_root", OUTPUT_ROOT)
+    summary_dir = Path(output_root) / "training" / run_id
     summary_dir.mkdir(parents=True, exist_ok=True)
     enabled = [surface for surface in SURFACES if config["surfaces"][surface]["enabled"]]
     parallel, assignments = _resolve_training_devices(config)
@@ -363,7 +371,10 @@ def run_all_training(config=None, run_id=None):
         processes = {
             surface: context.Process(
                 target=_training_worker,
-                args=(queue, config, surface, assignments[surface], run_id),
+                args=(
+                    queue, config, surface, assignments[surface], run_id,
+                    training_data_root, output_root,
+                ),
                 name=f"train-{surface}",
             )
             for surface in enabled
@@ -377,7 +388,10 @@ def run_all_training(config=None, run_id=None):
             process.join()
     else:
         for surface in enabled:
-            item = _run_surface_from_config(config, surface, assignments[surface], run_id)
+            item = _run_surface_from_config(
+                config, surface, assignments[surface], run_id,
+                training_data_root, output_root,
+            )
             results[surface] = item
             # Release the completed surface before constructing the next model on
             # a one-GPU/CPU run.  run_training's locals are already out of scope,
@@ -683,6 +697,14 @@ def _build_parser():
         "--config", type=Path, default=TRAIN_CONFIG_PATH,
         help="training configuration JSON (default: configs/training.json)",
     )
+    parser.add_argument(
+        "--training-data-root", type=Path, default=None,
+        help="directory containing data_load_*.json (default: training_data)",
+    )
+    parser.add_argument(
+        "--output-root", type=Path, default=None,
+        help="root for training outputs (default: outputs)",
+    )
     parser.add_argument("--run-id", help="optional output run name")
     parser.add_argument(
         "--surface", choices=("both", "endo", "epi"),
@@ -743,6 +765,16 @@ def _apply_cli_overrides(config, args):
 def main(argv=None):
     args = _build_parser().parse_args(argv)
     config = _apply_cli_overrides(load_training_config(args.config), args)
+    if args.training_data_root is not None:
+        root = args.training_data_root
+        config["_training_data_root"] = str(
+            root if root.is_absolute() else REPO_ROOT / root
+        )
+    if args.output_root is not None:
+        root = args.output_root
+        config["_output_root"] = str(
+            root if root.is_absolute() else REPO_ROOT / root
+        )
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     result = run_all_training(config=config, run_id=args.run_id)
     raise SystemExit(0 if result["status"] == "success" else 1)

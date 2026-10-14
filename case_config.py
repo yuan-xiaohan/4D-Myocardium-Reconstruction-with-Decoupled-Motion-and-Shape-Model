@@ -7,6 +7,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from dataset_layout import discover_inference_masks
 from project_config import CASE_CONFIG_PATH, INPUT_ROOT, OUTPUT_ROOT, REPO_ROOT
 
 
@@ -40,7 +41,7 @@ DEFAULTS = {
         "preprocess": True,
         "inference": True,
         "postprocess": True,
-        "video": True,
+        "video": False,
     },
 }
 
@@ -119,12 +120,7 @@ def _resolve_path(value: str | Path | None, default: Path | None = None) -> Path
 
 
 def discover_case_ids(input_root: Path, case_overrides: dict) -> list[str]:
-    discovered = set()
-    if input_root.is_dir():
-        discovered.update(
-            path.name for path in input_root.iterdir()
-            if path.is_dir() and (path / "masks").is_dir()
-        )
+    discovered = set(discover_inference_masks(Path(input_root))) if Path(input_root).is_dir() else set()
     for case_id, override in case_overrides.items():
         if not isinstance(case_id, str) or not case_id.strip():
             raise ValueError(f"Invalid case id: {case_id!r}")
@@ -192,17 +188,24 @@ def load_case_configs(
     case_ids = discover_case_ids(Path(input_root), overrides)
     if not case_ids:
         raise RuntimeError(
-            f"No cases found below {input_root}; expected inputs/<case>/masks or "
-            "a cases.<id>.input_mask_dir override"
+            f"No cases found below {input_root}; expected either "
+            "<case>/mask(s) or mask(s)/<case>, or a "
+            "cases.<id>.input_mask_dir override"
         )
 
     configs = []
     for case_id in case_ids:
         values = _merge_known(defaults, overrides.get(case_id, {}), f"cases.{case_id}")
         _validate_resolved(case_id, values)
-        mask_dir = _resolve_path(
-            values["input_mask_dir"], Path(input_root) / case_id / "masks"
-        )
+        if values["input_mask_dir"] is not None:
+            mask_dir = _resolve_path(values["input_mask_dir"])
+        else:
+            discovered_masks = discover_inference_masks(Path(input_root))
+            if case_id not in discovered_masks:
+                raise FileNotFoundError(
+                    f"No mask directory discovered for {case_id} under {input_root}"
+                )
+            mask_dir = discovered_masks[case_id]
         prepared_root = _resolve_path(values["prepared_root"])
         checkpoint_dirs = {
             surface: _resolve_path(value)

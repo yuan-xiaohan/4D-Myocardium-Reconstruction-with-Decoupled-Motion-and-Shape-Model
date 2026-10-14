@@ -1,8 +1,10 @@
-"""Render one postprocessed 4DMM case with input-observation overlays."""
+"""Render postprocessed 4DMM meshes with input-observation overlays."""
 
 from __future__ import annotations
 
 import json
+import ctypes.util
+import os
 from pathlib import Path
 
 import cv2
@@ -13,8 +15,9 @@ import pyvista.plotting._vtk as pyvista_vtk
 import pyvista.plotting.plotter as plotter_module
 
 from case_config import CaseConfig, load_case_configs
-from postprocess_4dmm_bridge import validate_combined_mesh
 from preprocess_mask import discover_frames, extract_contours, load_preprocess_report
+
+from .contract import classify_postprocess_mesh
 
 
 FPS = 10.0
@@ -47,21 +50,33 @@ def _configure_offscreen_backend() -> str:
     usable visual.  The bundled VTK wheels expose OSMesa, which renders the
     same fixed-camera frames entirely off-screen and works without DISPLAY.
     """
+    # On SSH hosts, ``xvfb-run`` supplies a safe X visual.  Do not replace
+    # VTK's X window with vtkOSOpenGLRenderWindow merely because the Python
+    # class exists: many wheels ship that class without libOSMesa, and the
+    # first screenshot can then segfault instead of raising an exception.
+    if os.environ.get("DISPLAY"):
+        pv.OFF_SCREEN = True
+        return "x11-offscreen"
     osmesa_window = getattr(vtk, "vtkOSOpenGLRenderWindow", None)
-    if osmesa_window is not None:
+    if osmesa_window is not None and ctypes.util.find_library("OSMesa"):
         plotter_module._vtk.vtkRenderWindow = osmesa_window
         pyvista_vtk.vtkRenderWindow = osmesa_window
         return "osmesa"
-    pv.OFF_SCREEN = True
-    return "default-offscreen"
+    raise RuntimeError(
+        "No safe headless VTK renderer is available. Run the video stage with "
+        "a virtual display, for example: xvfb-run -a python run_pipeline.py"
+    )
 
 
-def _load_stitched_phase(config: CaseConfig, phase: int) -> dict[str, pv.PolyData]:
+def _load_stitched_phase(
+    config: CaseConfig, phase: int
+) -> tuple[dict[str, pv.PolyData], dict]:
     path = config.output_dir / "vtk" / f"frame_{phase:02d}.vtk"
     if not path.is_file():
         raise FileNotFoundError(path)
     combined = pv.read(str(path)).extract_surface().triangulate()
-    validate_combined_mesh(combined)
+    output_kind, validation = classify_postprocess_mesh(combined)
+    is_raw_concat = output_kind == "raw_concat"
     surface_ids = np.asarray(combined.cell_data["surface_id"]).reshape(-1)
     surfaces = {}
     for surface, surface_id in (("epi", 0), ("endo", 1)):
@@ -72,7 +87,12 @@ def _load_stitched_phase(config: CaseConfig, phase: int) -> dict[str, pv.PolyDat
         if not selected.n_points or not selected.n_cells:
             raise RuntimeError(f"Empty {surface} surface in {path}")
         surfaces[surface] = selected
-    return surfaces
+    return surfaces, {
+        "phase": int(phase),
+        "strict_postprocess_passed": not is_raw_concat,
+        "output_kind": output_kind,
+        "validation": validation,
+    }
 
 
 def _world_to_normalized(meshes, transform, offset, scale):
@@ -235,12 +255,26 @@ def _image_on_white(image):
     return np.clip(color * alpha + 255.0 * (1.0 - alpha), 0, 255).astype(np.uint8)
 
 
-def _labeled_frame(image, case_id: str, phase: int):
+def _labeled_frame(
+    image, case_id: str, phase: int, strict_postprocess_passed: bool = True
+):
     frame = np.full((VIDEO_SIZE[1], VIDEO_SIZE[0], 3), 255, dtype=np.uint8)
     frame[LABEL_HEIGHT:] = _image_on_white(image)
-    label = f"4DMM + input | {case_id} | phase {phase:02d}"
     font, font_scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2
-    cv2.putText(frame, label, (10, 28), font, font_scale, (20, 20, 20), thickness, cv2.LINE_AA)
+    if strict_postprocess_passed:
+        label = f"4DMM + input | {case_id} | phase {phase:02d}"
+        color = (20, 20, 20)
+    else:
+        label = f"{case_id} | phase {phase:02d} | RAW CONCAT"
+        color = (20, 20, 220)
+        cv2.rectangle(
+            frame,
+            (1, LABEL_HEIGHT),
+            (VIDEO_SIZE[0] - 2, VIDEO_SIZE[1] - 2),
+            color,
+            3,
+        )
+    cv2.putText(frame, label, (10, 28), font, font_scale, color, thickness, cv2.LINE_AA)
     cv2.line(frame, (315, 20), (333, 20), EPI_BGR, 4)
     cv2.putText(frame, "epi", (338, 26), font, 0.48, (20, 20, 20), 1, cv2.LINE_AA)
     cv2.line(frame, (391, 20), (409, 20), ENDO_BGR, 4)
@@ -368,10 +402,14 @@ def run_case_video(config: CaseConfig, preprocess_report: dict) -> dict:
     scale = float(transform_info["scale"])
     observations = _load_observations(config, preprocess_report)
     reference_phase = int(config.reference_phase)
+    reference_world_meshes, reference_diagnostics = _load_stitched_phase(
+        config, reference_phase
+    )
     reference_meshes = _world_to_normalized(
-        _load_stitched_phase(config, reference_phase), transform, offset, scale
+        reference_world_meshes, transform, offset, scale
     )
     reference_center = _center(reference_meshes)
+    phase_diagnostics = {reference_phase: reference_diagnostics}
 
     video_root = config.output_dir / "Mesh_video"
     video_root.mkdir(parents=True, exist_ok=True)
@@ -389,9 +427,21 @@ def run_case_video(config: CaseConfig, preprocess_report: dict) -> dict:
                 f"[video] {config.case_id} {index:02d}/{len(phases)} phase={phase:02d}",
                 flush=True,
             )
-            meshes = reference_meshes if phase == reference_phase else _world_to_normalized(
-                _load_stitched_phase(config, phase), transform, offset, scale
-            )
+            if phase == reference_phase:
+                meshes = reference_meshes
+                diagnostics = reference_diagnostics
+            else:
+                world_meshes, diagnostics = _load_stitched_phase(config, phase)
+                meshes = _world_to_normalized(
+                    world_meshes, transform, offset, scale
+                )
+                phase_diagnostics[phase] = diagnostics
+            if not diagnostics["strict_postprocess_passed"]:
+                print(
+                    f"[video] warning {config.case_id} phase={phase:02d}: "
+                    "rendering raw-concatenated diagnostic VTK",
+                    flush=True,
+                )
             if phase not in observations:
                 raise ValueError(f"No input observation for phase {phase}")
             frame = _labeled_frame(
@@ -405,6 +455,9 @@ def run_case_video(config: CaseConfig, preprocess_report: dict) -> dict:
                 ),
                 config.case_id,
                 phase,
+                strict_postprocess_passed=diagnostics[
+                    "strict_postprocess_passed"
+                ],
             )
             writer.write(frame)
             if phase == reference_phase and not cv2.imwrite(str(preview), frame):
@@ -415,6 +468,11 @@ def run_case_video(config: CaseConfig, preprocess_report: dict) -> dict:
         raise RuntimeError(f"Video writer produced no data: {partial}")
     summary = _validate_video(partial, len(phases))
     partial.replace(output)
+    raw_concat_phases = sorted(
+        phase
+        for phase, diagnostics in phase_diagnostics.items()
+        if not diagnostics["strict_postprocess_passed"]
+    )
     return {
         "case_id": config.case_id,
         "video": str(output),
@@ -423,8 +481,11 @@ def run_case_video(config: CaseConfig, preprocess_report: dict) -> dict:
         "render_mode": "input_overlay",
         "observation_mode": observations[phases[0]]["mode"],
         "backend": backend,
-        "camera": "UVRecons fixed reference-phase paper view",
+        "camera": "fixed reference-phase paper view",
         "zoom": MESH_ZOOM,
+        "contains_diagnostic_frames": bool(raw_concat_phases),
+        "raw_concat_phases": raw_concat_phases,
+        "strict_postprocess_passed_frames": len(phases) - len(raw_concat_phases),
         **summary,
         "all_passed": True,
     }
