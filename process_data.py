@@ -46,6 +46,7 @@ DATASET_CASES = {}
 TRANSFORM_CACHE = {}
 REFERENCE_PHASE = 0
 MIRROR = "auto"
+MIRROR_FALLBACK = "error"
 SLICE_ORDER = "auto"
 
 TRAIN_KEYS = {"pos", "neg", "t", "P", "Pi", "offset", "scale"}
@@ -107,6 +108,7 @@ def ensure_dataset_transforms() -> None:
                 output_path=transform_path,
                 reference_phase=REFERENCE_PHASE,
                 mirror=MIRROR,
+                mirror_fallback=MIRROR_FALLBACK,
                 slice_order=SLICE_ORDER,
             )
             orientation = generated["orientation"]
@@ -432,6 +434,11 @@ def _build_parser():
         help="orientation used only when generating a missing P.txt",
     )
     parser.add_argument(
+        "--mirror-fallback", choices=("error", "normal", "mirrored"),
+        default="error",
+        help="explicit fallback when automatic RV top-view scoring is inconclusive",
+    )
+    parser.add_argument(
         "--slice-order", choices=("auto", "atob", "btoa"), default="auto",
         help="slice order used only when generating a missing P.txt",
     )
@@ -453,7 +460,7 @@ def _apply_cli_args(args):
     global INPUT_FORMAT, DATASET_ROOT, DATASET_CASES, TRANSFORM_CACHE
     global TRAIN_CASE_IDS, TRAIN_PHASES, OVERWRITE, VALIDATE_ONLY
     global SDF_SAMPLE_COUNT, SURFACE_SAMPLE_COUNT
-    global REFERENCE_PHASE, MIRROR, SLICE_ORDER
+    global REFERENCE_PHASE, MIRROR, MIRROR_FALLBACK, SLICE_ORDER
 
     root = args.training_data_root
     if not root.is_absolute():
@@ -478,6 +485,7 @@ def _apply_cli_args(args):
     VALIDATE_ONLY = args.validate_only
     REFERENCE_PHASE = args.reference_phase
     MIRROR = args.mirror
+    MIRROR_FALLBACK = args.mirror_fallback
     SLICE_ORDER = args.slice_order
     if args.sdf_samples < 1 or args.surface_samples < 1:
         raise ValueError("sample counts must be positive")

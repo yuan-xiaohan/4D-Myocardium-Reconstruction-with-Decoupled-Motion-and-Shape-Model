@@ -12,9 +12,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 import SimpleITK as sitk
-from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
 
+from anatomical_mirror import infer_auto_mirror
 from case_config import CaseConfig
 from project_config import REGISTRATION_ASSET
 
@@ -22,7 +22,6 @@ from project_config import REGISTRATION_ASSET
 SCALE = 0.014467
 OFFSET = np.zeros(3, dtype=np.float64)
 ALLOWED_LABELS = {0, 1, 2, 3}
-LOW_CONFIDENCE_THRESHOLD = 0.05
 
 
 @dataclass(frozen=True)
@@ -51,7 +50,6 @@ class RegistrationAssets:
     rv_raw: np.ndarray
     lv_norm: np.ndarray
     rv_norm: np.ndarray
-    insertion_curves: tuple[np.ndarray, np.ndarray]
     sha256: str
 
 
@@ -88,15 +86,13 @@ def load_registration_assets(path: Path = REGISTRATION_ASSET) -> RegistrationAss
             f"Registration asset hash mismatch: expected={expected_hash}, actual={actual_hash}"
         )
     with np.load(path, allow_pickle=False) as archive:
-        expected = {
-            "centerline", "rv_raw", "lv_norm", "rv_norm",
-            "insertion_curve_0", "insertion_curve_1",
-        }
-        if set(archive.files) != expected:
+        required = {"centerline", "rv_raw", "lv_norm", "rv_norm"}
+        missing = required.difference(archive.files)
+        if missing:
             raise ValueError(
-                f"Registration asset keys mismatch: {sorted(archive.files)}"
+                f"Registration asset is missing keys: {sorted(missing)}"
             )
-        arrays = {key: np.asarray(archive[key], dtype=np.float64) for key in expected}
+        arrays = {key: np.asarray(archive[key], dtype=np.float64) for key in required}
     for key, value in arrays.items():
         if value.ndim != 2 or value.shape[1] != 3 or not np.isfinite(value).all():
             raise ValueError(f"Invalid registration array {key}: {value.shape}")
@@ -105,7 +101,6 @@ def load_registration_assets(path: Path = REGISTRATION_ASSET) -> RegistrationAss
         rv_raw=arrays["rv_raw"],
         lv_norm=arrays["lv_norm"],
         rv_norm=arrays["rv_norm"],
-        insertion_curves=(arrays["insertion_curve_0"], arrays["insertion_curve_1"]),
         sha256=actual_hash,
     )
 
@@ -391,6 +386,8 @@ class RigidRegistrar:
         return float(np.mean(scores))
 
     def register(self, contours: SliceContours, mode: str) -> RegistrationResult:
+        if mode not in {"normal", "mirrored"}:
+            raise ValueError(f"Unsupported mirror mode: {mode}")
         matrix = self._refine(contours, self._coarse(contours))
         if mode == "mirrored":
             reflection = np.eye(4)
@@ -399,92 +396,23 @@ class RigidRegistrar:
             matrix = reflection @ matrix
         matrix = np.round(matrix, decimals=6)
         inverse = np.linalg.inv(matrix)
+        score = self._score(contours, matrix)
+        if not np.isfinite(score):
+            raise ValueError(f"Non-finite registration score for mirror={mode}")
+        determinant = float(np.linalg.det(matrix[:3, :3]))
+        expected_sign = -1.0 if mode == "mirrored" else 1.0
+        if not np.isclose(determinant, expected_sign, atol=1e-5):
+            raise ValueError(
+                f"Unexpected transform determinant {determinant} for mirror={mode}"
+            )
         return RegistrationResult(
             rigid=matrix,
             inverse_rigid=inverse,
             scale=SCALE,
             offset=OFFSET.copy(),
             mode=mode,
-            score=self._score(contours, matrix),
+            score=score,
         )
-
-
-def _largest_component(mask: np.ndarray) -> np.ndarray:
-    labels, count = ndi.label(mask)
-    if count == 0:
-        return np.zeros_like(mask, dtype=bool)
-    sizes = ndi.sum(mask, labels, index=np.arange(1, count + 1))
-    return labels == (int(np.argmax(sizes)) + 1)
-
-
-def _farthest_pair(points: np.ndarray) -> np.ndarray | None:
-    if len(points) < 2:
-        return None
-    if len(points) > 512:
-        points = points[np.linspace(0, len(points) - 1, 512).astype(int)]
-    distances = np.sum((points[:, None] - points[None, :]) ** 2, axis=-1)
-    return points[list(np.unravel_index(int(np.argmax(distances)), distances.shape))]
-
-
-def _physical_points(image: sitk.Image, points_zyx: np.ndarray) -> np.ndarray:
-    direction = np.asarray(image.GetDirection(), dtype=np.float64).reshape(3, 3)
-    spacing = np.asarray(image.GetSpacing(), dtype=np.float64)
-    origin = np.asarray(image.GetOrigin(), dtype=np.float64)
-    xyz = np.asarray(points_zyx, dtype=np.float64)[:, [2, 1, 0]]
-    return origin + (xyz * spacing) @ direction.T
-
-
-def extract_insertion_curves(path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
-    image = sitk.ReadImage(str(path))
-    mask = sitk.GetArrayFromImage(image).astype(np.int16)
-    pairs, valid_z, dilation_by_slice = [], [], {}
-    structure = np.ones((3, 3), dtype=bool)
-    for z, plane in enumerate(mask):
-        rv = plane == 1
-        lvm = plane == 2
-        if np.count_nonzero(rv) < 10 or np.count_nonzero(lvm) < 10:
-            continue
-        boundary = lvm & ~ndi.binary_erosion(lvm, structure=structure)
-        expanded = rv.copy()
-        pair = None
-        for dilation in range(1, 5):
-            expanded = ndi.binary_dilation(expanded, structure=structure)
-            contact = _largest_component(boundary & expanded)
-            pair_indices = _farthest_pair(np.argwhere(contact))
-            if pair_indices is not None:
-                points = np.c_[np.full(2, z), pair_indices]
-                pair = _physical_points(image, points)
-                dilation_by_slice[str(z)] = dilation
-                break
-        if pair is not None:
-            pairs.append(pair)
-            valid_z.append(z)
-    if len(pairs) < 2:
-        raise ValueError(f"Only {len(pairs)} valid RV-LV insertion slices in {path}")
-    ordered = [pairs[0]]
-    for pair in pairs[1:]:
-        previous = ordered[-1]
-        direct = np.linalg.norm(pair - previous, axis=1).sum()
-        swapped = np.linalg.norm(pair[::-1] - previous, axis=1).sum()
-        ordered.append(pair if direct <= swapped else pair[::-1])
-    curves = np.asarray(ordered, dtype=np.float64)
-    return curves[:, 0], curves[:, 1], {
-        "valid_slices": valid_z,
-        "dilation_by_slice": dilation_by_slice,
-    }
-
-
-def _resample_curve(curve: np.ndarray, count: int = 32) -> np.ndarray:
-    distances = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(curve, axis=0), axis=1))]
-    samples = np.linspace(0.0, distances[-1], count)
-    return np.column_stack(
-        [np.interp(samples, distances, curve[:, axis]) for axis in range(3)]
-    )
-
-
-def _chamfer(first: np.ndarray, second: np.ndarray) -> float:
-    distances = np.sum((first[:, None] - second[None, :]) ** 2, axis=-1)
-    return float(np.sqrt(distances.min(axis=1)).mean() + np.sqrt(distances.min(axis=0)).mean())
 
 
 def choose_registration(
@@ -492,7 +420,12 @@ def choose_registration(
     contours: SliceContours,
     reference_path: Path,
     requested_mode: str,
+    fallback_mode: str = "error",
 ) -> tuple[RegistrationResult, dict]:
+    if fallback_mode not in {"error", "normal", "mirrored"}:
+        raise ValueError(
+            "mirror fallback must be one of: error, normal, mirrored"
+        )
     if requested_mode != "auto":
         selected = registrar.register(contours, requested_mode)
         return selected, {
@@ -502,39 +435,31 @@ def choose_registration(
             "source": "case_override",
             "registration_score": selected.score,
         }
-    normal = registrar.register(contours, "normal")
-    mirrored = registrar.register(contours, "mirrored")
-    patient_curves, patient_curve_1, details = extract_insertion_curves(reference_path)
-    patient_curves = (patient_curves, patient_curve_1)
-    template_curves = registrar.assets.insertion_curves
-
-    def candidate_score(result: RegistrationResult, swap: bool) -> float:
-        observed = tuple(
-            _resample_curve(world_to_norm(curve, result.rigid)) for curve in patient_curves
-        )
-        targets = template_curves[::-1] if swap else template_curves
-        return float(np.mean([
-            _chamfer(observed[index], _resample_curve(targets[index]))
-            for index in range(2)
-        ]))
-
-    normal_score = candidate_score(normal, False)
-    mirrored_score = candidate_score(mirrored, True)
-    selected = normal if normal_score < mirrored_score else mirrored
-    best, worst = sorted((normal_score, mirrored_score))
-    margin = float((worst - best) / max(worst, 1e-8))
-    low_confidence = margin < LOW_CONFIDENCE_THRESHOLD
-    return selected, {
-        "requested": "auto",
-        "selected": selected.mode,
-        "score_normal": normal_score,
-        "score_mirrored": mirrored_score,
-        "normalized_margin": margin,
-        "threshold": LOW_CONFIDENCE_THRESHOLD,
-        "low_confidence": low_confidence,
-        "source": "minimum_insertion_curve_score",
-        **details,
-    }
+    decision = infer_auto_mirror(contours, registrar)
+    selected_mode = decision.get("mirror")
+    fallback = None
+    if not decision.get("accepted"):
+        if fallback_mode == "error":
+            raise ValueError(
+                "Automatic mirror confidence is insufficient; set mirror to "
+                "normal/mirrored or set mirror_fallback to normal/mirrored. "
+                f"Details: {decision}"
+            )
+        selected_mode = fallback_mode
+        fallback = fallback_mode
+    selected = registrar.register(contours, selected_mode)
+    report = dict(decision)
+    report.update(
+        {
+            "requested": "auto",
+            "selected": selected_mode,
+            "fallback": fallback,
+            "fallback_reason": decision.get("reason") if fallback else None,
+            "low_confidence": not bool(decision.get("accepted")),
+            "registration_score": selected.score,
+        }
+    )
+    return selected, report
 
 
 def phase_mapping(phases: list[int], reference_phase: int) -> list[dict]:
@@ -655,6 +580,7 @@ def compute_mask_transform(
     mirror: str = "auto",
     slice_order: str = "auto",
     asset_path: Path = REGISTRATION_ASSET,
+    mirror_fallback: str = "error",
 ) -> dict:
     """Compute one case-level normalization transform from a reference Mask."""
     frames = discover_frames(Path(mask_dir))
@@ -668,7 +594,7 @@ def compute_mask_transform(
     assets = load_registration_assets(Path(asset_path))
     contours = extract_contours(reference_path, slice_order)
     registration, orientation = choose_registration(
-        RigidRegistrar(assets), contours, reference_path, mirror
+        RigidRegistrar(assets), contours, reference_path, mirror, mirror_fallback
     )
     # Persist exactly the rounded matrix used by inference and derive Pi from
     # that representation so a generated P.txt is identical to pipeline use.
@@ -695,12 +621,14 @@ def write_mask_transform(
     mirror: str = "auto",
     slice_order: str = "auto",
     asset_path: Path = REGISTRATION_ASSET,
+    mirror_fallback: str = "error",
 ) -> dict:
     """Compute and atomically write a reusable case-level P.txt."""
     result = compute_mask_transform(
         mask_dir=mask_dir,
         reference_phase=reference_phase,
         mirror=mirror,
+        mirror_fallback=mirror_fallback,
         slice_order=slice_order,
         asset_path=asset_path,
     )
@@ -793,6 +721,7 @@ def run_preprocessing(config: CaseConfig, asset_path: Path = REGISTRATION_ASSET)
             mask_dir=config.input_mask_dir,
             reference_phase=config.reference_phase,
             mirror=config.mirror,
+            mirror_fallback=config.mirror_fallback,
             slice_order=config.slice_order,
             asset_path=asset_path,
         )
@@ -886,8 +815,8 @@ def run_preprocessing(config: CaseConfig, asset_path: Path = REGISTRATION_ASSET)
     _atomic_json(report_path, report)
     if orientation.get("low_confidence"):
         print(
-            f"[warning] {config.case_id}: auto mirror is low confidence; "
-            f"selected {orientation['selected']} by minimum score",
+            f"[warning] {config.case_id}: RV top-view mirror score was not accepted; "
+            f"using fallback {orientation['selected']}",
             flush=True,
         )
     if not report["all_passed"]:

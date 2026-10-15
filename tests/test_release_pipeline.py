@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -227,6 +226,7 @@ class PreprocessTests(unittest.TestCase):
                 enabled=True,
                 reference_phase=0,
                 mirror="normal",
+                mirror_fallback="error",
                 slice_order="auto",
                 num_iterations=1,
                 phase_batch_size=1,
@@ -286,6 +286,7 @@ class PreprocessTests(unittest.TestCase):
                 enabled=True,
                 reference_phase=0,
                 mirror="normal",
+                mirror_fallback="error",
                 slice_order="auto",
                 num_iterations=1,
                 phase_batch_size=1,
@@ -424,6 +425,7 @@ class PreprocessTests(unittest.TestCase):
                 enabled=True,
                 reference_phase=1,
                 mirror="normal",
+                mirror_fallback="error",
                 slice_order="auto",
                 num_iterations=1,
                 phase_batch_size=1,
@@ -491,19 +493,14 @@ class PreprocessTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unexpected labels"):
                 validate_labels(path, (1, 2, 3))
 
-    def test_auto_mirror_uses_minimum_score_and_reports_low_confidence(self):
-        curve = np.column_stack((np.linspace(0.0, 1.0, 8), np.zeros(8), np.zeros(8)))
-        assets = SimpleNamespace(insertion_curves=(curve, curve))
-
+    def test_auto_mirror_scores_candidates_then_registers_selected_mode(self):
         class Registrar:
-            def __init__(self, translated):
-                self.assets = assets
-                self.translated = translated
+            def __init__(self):
+                self.calls = []
 
             def register(self, contours, mode):
+                self.calls.append(mode)
                 matrix = np.eye(4)
-                if self.translated and mode == "mirrored":
-                    matrix[1, 3] = 10.0
                 return RegistrationResult(
                     rigid=matrix,
                     inverse_rigid=np.linalg.inv(matrix),
@@ -513,19 +510,55 @@ class PreprocessTests(unittest.TestCase):
                     score=0.0,
                 )
 
-        insertion = (curve, curve, {"valid_slices": [0, 1]})
-        with mock.patch("preprocess_mask.extract_insertion_curves", return_value=insertion):
-            selected, report = choose_registration(Registrar(True), None, Path("unused"), "auto")
-            self.assertEqual(selected.mode, "normal")
-            self.assertLess(report["score_normal"], report["score_mirrored"])
-            selected, report = choose_registration(Registrar(False), None, Path("unused"), "auto")
-            self.assertEqual(selected.mode, "mirrored")
-            self.assertTrue(report["low_confidence"])
+        accepted = {
+            "status": "accepted",
+            "accepted": True,
+            "mirror": "mirrored",
+            "confidence": 1.0,
+            "source": "rv_topview_auto_v1",
+            "reason": None,
+        }
+        registrar = Registrar()
+        with mock.patch(
+            "preprocess_mask.infer_auto_mirror", return_value=accepted
+        ) as infer:
+            selected, report = choose_registration(
+                registrar, None, Path("unused"), "auto"
+            )
+        infer.assert_called_once_with(None, registrar)
+        self.assertEqual(selected.mode, "mirrored")
+        self.assertEqual(registrar.calls, ["mirrored"])
+        self.assertEqual(report["selected"], "mirrored")
+        self.assertFalse(report["low_confidence"])
+
+        rejected = {
+            "status": "low_confidence",
+            "accepted": False,
+            "mirror": "mirrored",
+            "confidence": 0.55,
+            "source": "rv_topview_auto_v1",
+            "reason": "normalized margin below threshold",
+        }
+        registrar = Registrar()
+        with mock.patch("preprocess_mask.infer_auto_mirror", return_value=rejected):
+            with self.assertRaisesRegex(ValueError, "confidence is insufficient"):
+                choose_registration(registrar, None, Path("unused"), "auto")
+        self.assertEqual(registrar.calls, [])
+
+        registrar = Registrar()
+        with mock.patch("preprocess_mask.infer_auto_mirror", return_value=rejected):
+            selected, report = choose_registration(
+                registrar, None, Path("unused"), "auto", "normal"
+            )
+        self.assertEqual(selected.mode, "normal")
+        self.assertEqual(registrar.calls, ["normal"])
+        self.assertEqual(report["fallback"], "normal")
+        self.assertTrue(report["low_confidence"])
 
     def test_registration_asset_is_small_and_valid(self):
         assets = load_registration_assets()
         self.assertGreater(len(assets.centerline), 1)
-        self.assertEqual(len(assets.insertion_curves), 2)
+        self.assertGreater(len(assets.rv_norm), 1)
 
 
 if __name__ == "__main__":

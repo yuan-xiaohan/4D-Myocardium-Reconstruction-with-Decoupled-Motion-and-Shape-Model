@@ -13,6 +13,7 @@ from project_config import CASE_CONFIG_PATH, INPUT_ROOT, OUTPUT_ROOT, REPO_ROOT
 
 SURFACES = ("endo", "epi")
 MIRROR_MODES = {"auto", "normal", "mirrored"}
+MIRROR_FALLBACK_MODES = {"error", "normal", "mirrored"}
 SLICE_ORDERS = {"auto", "atob", "btoa"}
 PREPROCESS_MODES = {"mask", "prepared"}
 VIDEO_ORDERS = {"original", "reference"}
@@ -23,6 +24,7 @@ DEFAULTS = {
     "input_mask_dir": None,
     "reference_phase": 0,
     "mirror": "auto",
+    "mirror_fallback": "error",
     "slice_order": "auto",
     "num_iterations": 2000,
     "phase_batch_size": 4,
@@ -54,6 +56,7 @@ class CaseConfig:
     enabled: bool
     reference_phase: int
     mirror: str
+    mirror_fallback: str
     slice_order: str
     num_iterations: int
     phase_batch_size: int
@@ -147,6 +150,11 @@ def _validate_resolved(case_id: str, values: dict) -> None:
         raise ValueError(f"{case_id}.resolution must be at least 16")
     if values["mirror"] not in MIRROR_MODES:
         raise ValueError(f"{case_id}.mirror must be one of {sorted(MIRROR_MODES)}")
+    if values["mirror_fallback"] not in MIRROR_FALLBACK_MODES:
+        raise ValueError(
+            f"{case_id}.mirror_fallback must be one of "
+            f"{sorted(MIRROR_FALLBACK_MODES)}"
+        )
     if values["slice_order"] not in SLICE_ORDERS:
         raise ValueError(f"{case_id}.slice_order must be one of {sorted(SLICE_ORDERS)}")
     if values["preprocess_mode"] not in PREPROCESS_MODES:
@@ -231,6 +239,7 @@ def load_case_configs(
             enabled=values["enabled"],
             reference_phase=values["reference_phase"],
             mirror=values["mirror"],
+            mirror_fallback=values["mirror_fallback"],
             slice_order=values["slice_order"],
             num_iterations=values["num_iterations"],
             phase_batch_size=values["phase_batch_size"],

@@ -24,6 +24,9 @@ reference-phase Mask and uses it for every frame. An existing `P.txt` is loaded
 directly. If neither the transform nor the Mask is available, processing stops
 with an explicit error.
 
+Automatic RV top-view mirror scoring fails on low-confidence anatomy unless
+`--mirror-fallback normal|mirrored` is set explicitly.
+
 Run `process_data.py --dataset-root ... --training-data-root ...` to create
 the SDF archives and manifests. The transform is read once per case and used
 for every frame. The generated `processed/` archives are the training cache;
